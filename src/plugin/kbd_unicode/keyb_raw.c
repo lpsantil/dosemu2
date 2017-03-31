@@ -6,7 +6,6 @@
 
 #include <unistd.h>
 #include <termios.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,9 +25,9 @@
 #define LED_NUMLOCK	1
 #define LED_CAPSLOCK	2
 
-static int save_kbd_flags = -1;  	/* flags for STDIN before our fcntl */
 static struct termios save_termios;	/* original terminal modes */
 static int save_mode;                   /* original keyboard mode  */
+static int kbd_fd = -1;
 
 static void set_kbd_leds(t_modifiers shiftstate)
 {
@@ -71,24 +70,25 @@ static t_shiftstate get_kbd_flags(void)
   return s;
 }
 
-static void do_raw_getkeys(void)
+static void do_raw_getkeys(void *arg)
 {
   int i,count;
-  Bit8u buf[KBBUF_SIZE];
+  char buf[KBBUF_SIZE];
 
-  count = RPT_SYSCALL(read(kbd_fd, &buf, KBBUF_SIZE - 1));
+  count = RPT_SYSCALL(read(kbd_fd, buf, KBBUF_SIZE - 1));
   k_printf("KBD(raw): do_raw_getkeys() found %d characters (Raw)\n", count);
   if (count == -1) {
     k_printf("KBD(raw): do_raw_getkeys(): keyboard read failed!\n");
     return;
   }
 
-  for (i = 0; i < count; i++) {
-    k_printf("KBD(raw): readcode: %02x \n", buf[i]);
-    put_rawkey(buf[i]);
-#if 0
-    set_kbd_leds(get_shiftstate());
-#endif
+  if (config.console_keyb == KEYB_RAW) {
+    for (i = 0; i < count; i++) {
+      k_printf("KBD(raw): readcode: %02x \n", buf[i]);
+      put_rawkey(buf[i]);
+    }
+  } else {
+    paste_text(buf, count, "utf8");
   }
 }
 
@@ -108,17 +108,11 @@ static inline void set_raw_mode(void)
 {
   struct termios buf = save_termios;
 
-  k_printf("KBD(raw): Setting keyboard to RAW mode\n");
-  ioctl(kbd_fd, KDSKBMODE, K_RAW);
-
-  buf.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-  buf.c_iflag &= ~(IMAXBEL | IGNBRK | IGNCR | IGNPAR | BRKINT | INLCR | ICRNL | INPCK | ISTRIP | IXON | IUCLC | IXANY | IXOFF | IXON);
-  buf.c_cflag &= ~(CSIZE | PARENB);
-  buf.c_cflag |= CS8;
-  buf.c_oflag &= ~(OCRNL | OLCUC | ONLCR | OPOST);
-  buf.c_cc[VMIN] = 1;
-  buf.c_cc[VTIME] = 0;
-
+  if (config.console_keyb == KEYB_RAW) {
+    k_printf("KBD(raw): Setting keyboard to RAW mode\n");
+    ioctl(kbd_fd, KDSKBMODE, K_RAW);
+  }
+  cfmakeraw(&buf);
   k_printf("KBD(raw): Setting TERMIOS Structure.\n");
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &buf) < 0)
     k_printf("KBD(raw): Setting TERMIOS structure failed.\n");
@@ -140,11 +134,15 @@ static inline void set_raw_mode(void)
  */
 static int raw_keyboard_init(void)
 {
+  if (config.console_keyb > KEYB_TTY)
+    return FALSE;
+
   k_printf("KBD(raw): raw_keyboard_init()\n");
 
   kbd_fd = STDIN_FILENO;
 
-  ioctl(kbd_fd, KDGKBMODE, &save_mode);
+  if (config.console_keyb == KEYB_RAW)
+    ioctl(kbd_fd, KDGKBMODE, &save_mode);
 
   if (tcgetattr(kbd_fd, &save_termios) < 0) {
     error("KBD(raw): Couldn't tcgetattr(kbd_fd,...) !\n");
@@ -152,12 +150,9 @@ static int raw_keyboard_init(void)
     return FALSE;
   }
 
-  save_kbd_flags = fcntl(kbd_fd, F_GETFL);
-  fcntl(kbd_fd, F_SETFL, O_RDONLY | O_NONBLOCK);
-
   set_raw_mode();
 
-  add_to_io_select(kbd_fd, keyb_client_run_async, NULL);
+  add_to_io_select(kbd_fd, do_raw_getkeys, NULL);
 
   return TRUE;
 }
@@ -185,28 +180,23 @@ static void raw_keyboard_close(void)
   if (kbd_fd != -1) {
     k_printf("KBD(raw): raw_keyboard_close: resetting keyboard to original mode\n");
     remove_from_io_select(kbd_fd);
-    ioctl(kbd_fd, KDSKBMODE, save_mode);
+    if (config.console_keyb == KEYB_RAW) {
+      ioctl(kbd_fd, KDSKBMODE, save_mode);
 
-    k_printf("KBD(raw): resetting LEDs to normal mode\n");
-    ioctl(kbd_fd, KDSETLED, LED_NORMAL);
-
+      k_printf("KBD(raw): resetting LEDs to normal mode\n");
+      ioctl(kbd_fd, KDSETLED, LED_NORMAL);
+    }
     k_printf("KBD(raw): Resetting TERMIOS structure.\n");
     if (tcsetattr(kbd_fd, TCSAFLUSH, &save_termios) < 0) {
       k_printf("KBD(raw): Resetting keyboard termios failed.\n");
     }
-    fcntl(kbd_fd, F_SETFL, save_kbd_flags);
-
     kbd_fd = -1;
   }
 }
 
 static int raw_keyboard_probe(void)
 {
-	int result = FALSE;
-	if (config.console_keyb) {
-		result = TRUE;
-	}
-	return result;
+	return isatty(STDIN_FILENO);
 }
 
 struct keyboard_client Keyboard_raw =  {
@@ -215,7 +205,5 @@ struct keyboard_client Keyboard_raw =  {
    raw_keyboard_init,          /* init */
    raw_keyboard_reset,         /* reset */
    raw_keyboard_close,         /* close */
-   do_raw_getkeys,             /* run */
    set_kbd_leds,       	       /* set_leds */
 };
-

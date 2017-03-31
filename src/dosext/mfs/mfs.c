@@ -195,12 +195,15 @@ TODO:
 #include <linux/msdos_fs.h>
 #define kernel_dirent __fat_dirent
 #endif
-
+#define Addr_8086(x,y)  MK_FP32((x),(y) & 0xffff)
+#define Addr(s,x,y)     Addr_8086(((s)->x), ((s)->y))
+#define Stk_Addr(s,x,y) Addr_8086(((s)->x), ((s)->y) + stk_offs)
 /* vfat_ioctl to use is short for int2f/ax=11xx, both for int21/ax=71xx */
 static long vfat_ioctl = VFAT_IOCTL_READDIR_BOTH;
 
 /* these universal globals defined here (externed in dos.h) */
-boolean_t mach_fs_enabled = FALSE;
+static int mach_fs_enabled = FALSE;
+static int stk_offs;
 
 #define INSTALLATION_CHECK	0x0
 #define	REMOVE_DIRECTORY	0x1
@@ -259,15 +262,15 @@ static u_char redirected_drives = 0;
 struct drive_info drives[MAX_DRIVE];
 
 static int calculate_drive_pointers(int);
-static boolean_t dos_fs_dev(state_t *);
-static boolean_t compare(char *, char *, char *, char *);
-static int dos_fs_redirect(state_t *);
+static int dos_fs_dev(struct vm86_regs *);
+static int compare(char *, char *, char *, char *);
+static int dos_fs_redirect(struct vm86_regs *);
 static int is_long_path(const char *s);
 static void path_to_ufs(char *ufs, size_t ufs_offset, const char *path,
                         int PreserveEnvVar, int lowercase);
-static boolean_t dos_would_allow(char *fpath, const char *op, boolean_t equal);
+static int dos_would_allow(char *fpath, const char *op, int equal);
 
-static boolean_t drives_initialized = FALSE;
+static int drives_initialized = FALSE;
 
 static struct file_fd open_files[256];
 static u_char first_free_drive = 0;
@@ -352,6 +355,11 @@ int sda_ext_mode_off = 0x2e1;
 /* here are the functions used to interface dosemu with the mach
    dos redirector code */
 
+void mfs_set_stk_offs(int offs)
+{
+  stk_offs = offs;
+}
+
 static int cds_drive(cds_t cds)
 {
   ptrdiff_t cds_offset = cds - cds_base;
@@ -365,17 +373,17 @@ static int cds_drive(cds_t cds)
 
 /* Try and work out if the current command is for any of my drives */
 static int
-select_drive(state_t *state)
+select_drive(struct vm86_regs *state)
 {
   int dd;
-  boolean_t found = 0;
-  boolean_t check_cds = FALSE;
-  boolean_t check_dpb = FALSE;
-  boolean_t check_esdi_cds = FALSE;
-  boolean_t check_sda_ffn = FALSE;
-  boolean_t check_always = FALSE;
-  boolean_t check_dssi_fn = FALSE;
-  boolean_t cds_changed = FALSE;
+  int found = 0;
+  int check_cds = FALSE;
+  int check_dpb = FALSE;
+  int check_esdi_cds = FALSE;
+  int check_sda_ffn = FALSE;
+  int check_always = FALSE;
+  int check_dssi_fn = FALSE;
+  int cds_changed = FALSE;
 
   cds_t sda_cds = sda_cds(sda);
   cds_t esdi_cds = (cds_t) Addr(state, es, edi);
@@ -562,7 +570,7 @@ select_drive(state_t *state)
   return (dd);
 }
 
-boolean_t is_hidden(char *fname)
+int is_hidden(char *fname)
 {
   char *p = strrchr(fname,'/');
   if (p) fname = p+1;
@@ -581,7 +589,7 @@ static int fd_on_fat(int fd)
   return fstatfs(fd, &buf) == 0 && buf.f_type == MSDOS_SUPER_MAGIC;
 }
 
-int get_dos_attr(const char *fname,int mode,boolean_t hidden)
+int get_dos_attr(const char *fname,int mode,int hidden)
 {
   int attr = 0;
 
@@ -606,7 +614,7 @@ int get_dos_attr(const char *fname,int mode,boolean_t hidden)
   return (attr);
 }
 
-int get_dos_attr_fd(int fd,int mode,boolean_t hidden)
+int get_dos_attr_fd(int fd,int mode,int hidden)
 {
   int attr;
   if (fd_on_fat(fd) && (S_ISREG(mode) || S_ISDIR(mode)) &&
@@ -710,6 +718,13 @@ int dos_get_disk_space(const char *cwd, unsigned int *free, unsigned int *total,
   else
     return (0);
 }
+
+#if 0
+static void mfs_reset(void)
+{
+    stk_offs = 0;
+}
+#endif
 
 static void
 init_all_drives(void)
@@ -930,9 +945,9 @@ mfs_inte6(void)
 }
 
 int
-mfs_helper(state_t *regs)
+mfs_helper(struct vm86_regs *regs)
 {
-  boolean_t result;
+  int result;
 
   sigalarm_block(1);
   result = dos_fs_dev(regs);
@@ -1045,7 +1060,7 @@ static void dos83_to_ufs(char *name, const char *mname, const char *mext)
 }
 
 /* check if name/filename exists as such if it does not contain wildcards */
-static boolean_t exists(const char *name, const char *filename,
+static int exists(const char *name, const char *filename,
                         struct stat *st, int drive)
 {
   char fullname[strlen(name) + 1 + NAME_MAX + 1];
@@ -1085,12 +1100,12 @@ static void fill_entry(struct dir_ent *entry, const char *name, int drive)
 }
 
 /* converts d_name to DOS 8:3 and compares with the wildcard */
-static boolean_t convert_compare(char *d_name, char *fname, char *fext,
-				 char *mname, char *mext, boolean_t in_root)
+static int convert_compare(char *d_name, char *fname, char *fext,
+				 char *mname, char *mext, int in_root)
 {
   char tmpname[NAME_MAX + 1];
   size_t namlen;
-  boolean_t maybe_mangled;
+  int maybe_mangled;
 
   maybe_mangled = (mname[5] == '~' || mname[5] == '?');
 
@@ -1187,7 +1202,7 @@ static struct dir_list *get_dir(char *name, char *mname, char *mext, int drive)
     return (dir_list);
   }
   else {
-    boolean_t is_root = (strlen(name) == drives[drive].root_len);
+    int is_root = (strlen(name) == drives[drive].root_len);
     while ((cur_ent = dos_readdir(cur_dir))) {
       if (mname) {
 	sigset_t mask;
@@ -1588,8 +1603,8 @@ calculate_drive_pointers(int dd)
   return (1);
 }
 
-static boolean_t
-dos_fs_dev(state_t *state)
+static int
+dos_fs_dev(struct vm86_regs *state)
 {
   u_char drive_to_redirect;
   int dos_ver;
@@ -1848,7 +1863,7 @@ static inline int build_ufs_path(char *ufs, const char *path, int drive)
 /*
  * scan a directory for a matching filename
  */
-static boolean_t
+static int
 scan_dir(char *path, char *name, int drive)
 {
   struct mfs_dir *cur_dir;
@@ -1935,7 +1950,7 @@ scan_dir(char *path, char *name, int drive)
  * a new find_file that will do complete upper/lower case matching for the
  * whole path
  */
-boolean_t find_file(char *fpath, struct stat * st, int drive, int *doserrno)
+int find_file(char *fpath, struct stat * st, int drive, int *doserrno)
 {
   char *slash1, *slash2;
 
@@ -2029,7 +2044,7 @@ boolean_t find_file(char *fpath, struct stat * st, int drive, int *doserrno)
   return (TRUE);
 }
 
-static boolean_t
+static int
 compare(char *fname, char *fext, char *mname, char *mext)
 {
   int i;
@@ -2110,7 +2125,7 @@ static struct
   struct stack_entry stack[HLIST_STACK_SIZE];
 } hlists;
 
-static void free_list(struct stack_entry *se, boolean_t force)
+static void free_list(struct stack_entry *se, int force)
 {
   struct dir_list *list;
 
@@ -2396,7 +2411,7 @@ path_to_dos(char *path)
 }
 
 static int
-GetRedirection(state_t *state, u_short index)
+GetRedirection(struct vm86_regs *state, u_short index)
 {
   int dd;
   u_short returnBX;		/* see notes below */
@@ -2581,7 +2596,7 @@ int RedirectPrinter(char *resourceName)
  * notes:
  *****************************/
 static int
-RedirectDevice(state_t * state)
+RedirectDevice(struct vm86_regs * state)
 {
   char *resourceName;
   char *deviceName;
@@ -2718,7 +2733,7 @@ CancelDiskRedirection(int dsk)
  * notes:
  *****************************/
 static int
-CancelRedirection(state_t * state)
+CancelRedirection(struct vm86_regs * state)
 {
   char *deviceName;
   int drive;
@@ -2780,7 +2795,7 @@ static int lock_file_region(int fd, int cmd, struct flock *fl, long long start, 
   return fcntl( fd, cmd, fl );
 }
 
-static boolean_t
+static int
 share(int fd, int mode, int drive, sft_t sft)
 {
   /*
@@ -2988,7 +3003,7 @@ static void open_device(unsigned int devptr, char *fname, sft_t sft)
    to your own one. In that case Linux denies any chmod or utime,
    but DOS really expects any attribute/time set to succeed. We'll fake it
    with a warning, if the file is writable. */
-static boolean_t dos_would_allow(char *fpath, const char *op, boolean_t equal)
+static int dos_would_allow(char *fpath, const char *op, int equal)
 {
   if (errno != EPERM)
     return FALSE;
@@ -3009,10 +3024,10 @@ static boolean_t dos_would_allow(char *fpath, const char *op, boolean_t equal)
   return TRUE;
 }
 
-static boolean_t find_again(boolean_t firstfind, int drive, char *fpath,
-			    struct dir_list *hlist, state_t *state, sdb_t sdb)
+static int find_again(int firstfind, int drive, char *fpath,
+			    struct dir_list *hlist, struct vm86_regs *state, sdb_t sdb)
 {
-  boolean_t is_root;
+  int is_root;
   u_char attr;
   int hlist_index = sdb_p_cluster(sdb);
   struct dir_ent *de;
@@ -3207,7 +3222,7 @@ int dos_rename(const char *filename1, const char *filename2, int drive, int lfn)
   return 0;
 }
 
-static int validate_mode(char *fpath, state_t *state, int drive,
+static int validate_mode(char *fpath, struct vm86_regs *state, int drive,
 	u_short dos_mode, u_short *unix_mode, u_char *attr, struct stat *st)
 {
   int doserrno = FILE_NOT_FOUND;
@@ -3293,7 +3308,7 @@ static void do_update_sft(char *fpath, char *fname, char *fext, sft_t sft,
 }
 
 static int
-dos_fs_redirect(state_t *state)
+dos_fs_redirect(struct vm86_regs *state)
 {
   char *filename1;
   char *filename2;
@@ -3315,7 +3330,7 @@ dos_fs_redirect(state_t *state)
   char fext[3];
   char fpath[PATH_MAX];
   struct stat st;
-  boolean_t long_path;
+  int long_path;
   struct dir_list *hlist;
   int hlist_index;
   int doserrno = FILE_NOT_FOUND;
@@ -3596,7 +3611,7 @@ dos_fs_redirect(state_t *state)
     }
   case SET_FILE_ATTRIBUTES:	/* 0x0e */
     {
-      u_short att = *(u_short *) Addr(state, ss, esp);
+      u_short att = *(u_short *) Stk_Addr(state, ss, esp);
 
       Debug0((dbg_fd, "Set File Attributes %s 0%o\n", filename1, att));
       if (drives[drive].read_only || is_long_path(filename1)) {
@@ -3740,11 +3755,11 @@ dos_fs_redirect(state_t *state)
        statement. */
 
     /* get the high byte */
-    dos_mode = *(u_char *) (Addr(state, ss, esp) + 1);
+    dos_mode = *(u_char *) (Stk_Addr(state, ss, esp) + 1);
     dos_mode <<= 8;
 
     /* and the low one (isn't there a way to do this with one Addr ??) */
-    dos_mode |= *(u_char *)Addr(state, ss, esp);
+    dos_mode |= *(u_char *)Stk_Addr(state, ss, esp);
 
     /* check for a high bit set indicating an FCB call */
     FCBcall = sft_open_mode(sft) & 0x8000;
@@ -3766,7 +3781,7 @@ dos_fs_redirect(state_t *state)
 	   defined differently in two different places.  The important
 	   thing is that this doesn't work under dr-dos 6.0
 
-    attr = *(u_short *) Addr(state, ss, esp) */
+    attr = *(u_short *) Stk_Addr(state, ss, esp) */
 
 
     Debug0((dbg_fd, "Open existing file %s\n", filename1));
@@ -3827,9 +3842,9 @@ dos_fs_redirect(state_t *state)
     Debug0((dbg_fd, "FCBcall=0x%x\n", FCBcall));
 
     /* 01 in high byte = create new, 00 s just create truncate */
-    create_file = *(u_char *) (Addr(state, ss, esp) + 1);
+    create_file = *(u_char *) (Stk_Addr(state, ss, esp) + 1);
 
-    attr = *(u_short *) Addr(state, ss, esp);
+    attr = *(u_short *) Stk_Addr(state, ss, esp);
     Debug0((dbg_fd, "CHECK attr=0x%x, create=0x%x\n", attr, create_file));
 
     /* make it a byte - we thus ignore the new bit */
@@ -4164,7 +4179,7 @@ dos_fs_redirect(state_t *state)
     return (REDIRECT);
   case CONTROL_REDIRECT:	/* 0x1e */
     /* get low word of parameter, should be one of 2, 3, 4, 5 */
-    subfunc = LOW(*(u_short *) Addr(state, ss, esp));
+    subfunc = LOW(*(u_short *) Stk_Addr(state, ss, esp));
     Debug0((dbg_fd, "Control redirect, subfunction %d\n",
 	    subfunc));
     switch (subfunc) {
@@ -4196,12 +4211,12 @@ dos_fs_redirect(state_t *state)
     break;
   case MULTIPURPOSE_OPEN:
     {
-      boolean_t file_exists;
+      int file_exists;
       u_short action = sda_ext_act(sda);
 	  u_short mode;
 
       mode = sda_ext_mode(sda) & 0x7f;
-      attr = *(u_short *) Addr(state, ss, esp);
+      attr = *(u_short *) Stk_Addr(state, ss, esp);
       Debug0((dbg_fd, "Multipurpose open file: %s\n", filename1));
       Debug0((dbg_fd, "Mode, action, attr = %x, %x, %x\n",
 	      mode, action, attr));

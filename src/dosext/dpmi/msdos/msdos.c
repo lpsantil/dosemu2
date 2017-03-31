@@ -37,6 +37,7 @@
 #include "msdos_ldt.h"
 #include "callbacks.h"
 #include "msdos_priv.h"
+#include "msdos_ex.h"
 #include "msdos.h"
 
 #ifdef SUPPORT_DOSEMU_HELPERS
@@ -77,6 +78,7 @@ struct msdos_struct {
     unsigned short lowmem_seg;
     dpmi_pm_block mem_map[MSDOS_MAX_MEM_ALLOCS];
     far_t rmcbs[MAX_RMCBS];
+    unsigned short rmcb_sel;
     int rmcb_alloced;
     u_short ldt_alias;
     u_short ldt_alias_winos2;
@@ -88,6 +90,8 @@ static int msdos_client_num = 0;
 static int ems_frame_mapped;
 static int ems_handle;
 #define MSDOS_EMS_PAGES 4
+
+static unsigned int msdos_malloc(unsigned long size);
 
 static void *cbk_args(int idx)
 {
@@ -120,13 +124,13 @@ static unsigned short trans_buffer_seg(void)
     return EMM_SEG;
 }
 
-void msdos_setup(void)
-{
-}
-
-void msdos_reset(u_short emm_s)
+void msdos_setup(u_short emm_s)
 {
     EMM_SEG = emm_s;
+}
+
+void msdos_reset(void)
+{
     ems_handle = emm_allocate_handle(MSDOS_EMS_PAGES);
 }
 
@@ -147,7 +151,12 @@ void msdos_init(int is_32, unsigned short mseg)
     }
     if (msdos_client_num == 1 ||
 	    msdos_client[msdos_client_num - 2].is_32 != is_32) {
-	callbacks_init(cbk_args, MSDOS_CLIENT.rmcbs);
+	int len = sizeof(struct RealModeCallStructure);
+	unsigned int rmcb_mem = msdos_malloc(len);
+	MSDOS_CLIENT.rmcb_sel = AllocateDescriptors(1);
+	SetSegmentBaseAddress(MSDOS_CLIENT.rmcb_sel, rmcb_mem);
+	SetSegmentLimit(MSDOS_CLIENT.rmcb_sel, len - 1);
+	callbacks_init(MSDOS_CLIENT.rmcb_sel, cbk_args, MSDOS_CLIENT.rmcbs);
 	MSDOS_CLIENT.rmcb_alloced = 1;
     } else {
 	memcpy(MSDOS_CLIENT.rmcbs, msdos_client[msdos_client_num - 2].rmcbs,
@@ -159,16 +168,47 @@ void msdos_init(int is_32, unsigned short mseg)
     SetDescriptorAccessRights(MSDOS_CLIENT.ldt_alias_winos2, 0xf0);
     SetSegmentLimit(MSDOS_CLIENT.ldt_alias_winos2,
 	    LDT_ENTRIES * LDT_ENTRY_SIZE - 1);
-    D_printf("MSDOS: init, %i\n", msdos_client_num);
+    D_printf("MSDOS: init %i, ldt_alias=0x%x winos2_alias=0x%x\n",
+              msdos_client_num, MSDOS_CLIENT.ldt_alias,
+              MSDOS_CLIENT.ldt_alias_winos2);
+}
+
+static void msdos_free_mem(void)
+{
+    int i;
+    for (i = 0; i < MSDOS_MAX_MEM_ALLOCS; i++) {
+	if (MSDOS_CLIENT.mem_map[i].size) {
+	    DPMIfree(MSDOS_CLIENT.mem_map[i].handle);
+	    MSDOS_CLIENT.mem_map[i].size = 0;
+	}
+    }
+}
+
+static void msdos_free_descriptors(void)
+{
+    int i;
+    for (i = 0; i < MAX_CNVS; i++) {
+	struct seg_sel *m = &MSDOS_CLIENT.seg_sel_map[i];
+	if (!m->sel)
+	    break;
+	FreeDescriptor(m->sel);
+	m->sel = 0;
+    }
+
+    FreeDescriptor(MSDOS_CLIENT.ldt_alias_winos2);
 }
 
 void msdos_done(void)
 {
-    if (MSDOS_CLIENT.rmcb_alloced)
-	free_realmode_callbacks(MSDOS_CLIENT.rmcbs, MAX_RMCBS);
+    if (MSDOS_CLIENT.rmcb_alloced) {
+	callbacks_done(MSDOS_CLIENT.rmcbs);
+	FreeDescriptor(MSDOS_CLIENT.rmcb_sel);
+    }
     if (get_env_sel())
 	write_env_sel(GetSegmentBase(get_env_sel()) >> 4);
     msdos_ldt_done(msdos_client_num);
+    msdos_free_descriptors();
+    msdos_free_mem();
     msdos_client_num--;
     D_printf("MSDOS: done, %i\n", msdos_client_num);
 }
@@ -286,6 +326,44 @@ static void restore_ems_frame(void)
     ems_frame_mapped = 0;
     if (debug_level('M') >= 5)
 	D_printf("MSDOS: EMS frame unmapped\n");
+}
+
+static void rm_do_int(u_short flags, u_short cs, u_short ip,
+		      struct RealModeCallStructure *rmreg,
+		      int *r_rmask, u_char * stk, int stk_len,
+		      int *stk_used)
+{
+    u_short *sp = (u_short *) (stk + stk_len - *stk_used);
+
+    g_printf("fake_int() CS:IP %04x:%04x\n", cs, ip);
+    *--sp = get_FLAGS(flags);
+    *--sp = cs;
+    *--sp = ip;
+    *stk_used += 6;
+    RMREG(flags) = flags & ~(AC | VM | TF | NT | IF);
+    *r_rmask |= 1 << flags_INDEX;
+}
+
+static void rm_do_int_to(u_short flags, u_short cs, u_short ip,
+		  struct RealModeCallStructure *rmreg,
+		  int *r_rmask, u_char * stk, int stk_len, int *stk_used)
+{
+    int rmask = *r_rmask;
+
+    rm_do_int(flags, READ_RMREG(cs, rmask), READ_RMREG(ip, rmask),
+	      rmreg, r_rmask, stk, stk_len, stk_used);
+    RMREG(cs) = cs;
+    RMREG(ip) = ip;
+}
+
+static void rm_int(int intno, u_short flags,
+	    struct RealModeCallStructure *rmreg,
+	    int *r_rmask, u_char * stk, int stk_len, int *stk_used)
+{
+    far_t addr = DPMI_get_real_mode_interrupt_vector(intno);
+
+    rm_do_int_to(flags, addr.segment, addr.offset, rmreg, r_rmask,
+		 stk, stk_len, stk_used);
 }
 
 static void get_ext_API(struct sigcontext *scp)
@@ -1162,6 +1240,10 @@ int msdos_pre_extender(struct sigcontext *scp, int intr,
 	break;
     case 0x2f:
 	switch (_LWORD(eax)) {
+	case 0x1688:
+	    _eax = 0;
+	    _ebx = MSDOS_CLIENT.ldt_alias;
+	    return MSDOS_DONE;
 	case 0x168a:
 	    get_ext_API(scp);
 	    return MSDOS_DONE;
@@ -1266,7 +1348,7 @@ int msdos_pre_extender(struct sigcontext *scp, int intr,
  * DANG_END_FUNCTION
  */
 
-int msdos_post_extender(struct sigcontext *scp, int intr,
+void msdos_post_extender(struct sigcontext *scp, int intr,
 				const struct RealModeCallStructure *rmreg)
 {
     u_short ax = _LWORD(eax);
@@ -1333,7 +1415,8 @@ int msdos_post_extender(struct sigcontext *scp, int intr,
 	case 0x4310: {
 	    struct pmaddr_s pma;
 	    MSDOS_CLIENT.XMS_call = MK_FARt(RMREG(es), RMLWORD(bx));
-	    pma = get_pmrm_handler(XMS_CALL, xms_call, &MSDOS_CLIENT.XMS_call);
+	    pma = get_pmrm_handler(XMS_CALL, xms_call, &MSDOS_CLIENT.XMS_call,
+		    xms_ret);
 	    SET_REG(es, pma.selector);
 	    SET_REG(ebx, pma.offset);
 	    break;
@@ -1636,5 +1719,30 @@ int msdos_post_extender(struct sigcontext *scp, int intr,
 
     if (need_xbuf(intr, ax))
 	restore_ems_frame();
-    return update_mask;
+    rm_to_pm_regs(scp, rmreg, update_mask);
+}
+
+const char *msdos_describe_selector(unsigned short sel)
+{
+    int i;
+    struct seg_sel *m = NULL;
+
+    if (sel == 0)
+	return "NULL selector";
+    if (sel == MSDOS_CLIENT.ldt_alias)
+	return "LDT alias";
+    if (sel == MSDOS_CLIENT.ldt_alias_winos2)
+	return "R/O LDT alias";
+    if (sel == MSDOS_CLIENT.user_dta_sel)
+	return "DTA";
+    if (sel == MSDOS_CLIENT.user_psp_sel)
+	return "PSP";
+    for (i = 0; i < MAX_CNVS; i++) {
+	m = &MSDOS_CLIENT.seg_sel_map[i];
+	if (!m->sel)
+	    break;
+	if (m->sel == sel)
+	    return "rm segment alias";
+    }
+    return NULL;
 }

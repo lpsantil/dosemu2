@@ -31,9 +31,8 @@
 #include "utilities.h"
 #include "mapping.h"
 #include "smalloc.h"
-#include "dmemory.h"
 #include "dpmi.h"
-#include "dpmisel.h"
+#include "dmemory.h"
 
 #ifndef PAGE_SHIFT
 #define PAGE_SHIFT		12
@@ -131,16 +130,6 @@ static int uncommit(void *ptr, size_t size)
 	DOSADDR_REL(ptr), size, PROT_NONE) == MAP_FAILED)
     return 0;
   return 1;
-}
-
-unsigned long dpmi_mem_size(void)
-{
-    return PAGE_ALIGN(config.dpmi * 1024) +
-      PAGE_ALIGN(DPMI_pm_stack_size * DPMI_MAX_CLIENTS) +
-      PAGE_ALIGN(LDT_ENTRIES*LDT_ENTRY_SIZE) +
-      PAGE_ALIGN(DPMI_sel_code_end-DPMI_sel_code_start) +
-      PAGE_ALIGN(DPMI_sel_data_end-DPMI_sel_data_start) +
-      (5 << PAGE_SHIFT); /* 5 extra pages */
 }
 
 int dpmi_alloc_pool(void)
@@ -306,7 +295,7 @@ dpmi_pm_block * DPMI_mallocLinear(dpmi_pm_block_root *root,
   unsigned int base, unsigned int size, int committed)
 {
     dpmi_pm_block *block;
-    unsigned char *ptr, *realbase;
+    unsigned char *realbase;
     int i;
 
    /* aligned size to PAGE size */
@@ -314,9 +303,7 @@ dpmi_pm_block * DPMI_mallocLinear(dpmi_pm_block_root *root,
     if (base == -1)
 	return NULL;
     if (base == 0)
-	ptr = (void *)-1;
-    else
-	ptr = MEM_BASE32(base);
+	base = -1;
     if (committed && size > dpmi_free_memory)
 	return NULL;
     if ((block = alloc_pm_block(root, size)) == NULL)
@@ -325,7 +312,7 @@ dpmi_pm_block * DPMI_mallocLinear(dpmi_pm_block_root *root,
     /* base is just a hint here (no MAP_FIXED). If vma-space is
        available the hint will be block->base */
     realbase = mmap_mapping(MAPPING_DPMI | MAPPING_SCRATCH | MAPPING_NOOVERLAP,
-	DOSADDR_REL(ptr), size, committed ? PROT_READ | PROT_WRITE | PROT_EXEC : PROT_NONE);
+	base, size, committed ? PROT_READ | PROT_WRITE | PROT_EXEC : PROT_NONE);
     if (realbase == MAP_FAILED) {
 	free_pm_block(root, block);
 	return NULL;
@@ -336,8 +323,8 @@ dpmi_pm_block * DPMI_mallocLinear(dpmi_pm_block_root *root,
 	block->attrs[i] = committed ? 9 : 8;
     if (committed)
 	dpmi_free_memory -= size;
-    block -> handle = pm_block_handle_used++;
-    block -> size = size;
+    block->handle = pm_block_handle_used++;
+    block->size = size;
     return block;
 }
 

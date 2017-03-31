@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #include "config.h"
 #include "emu.h"
@@ -49,22 +50,10 @@ static int do_doshelper(int ax, int bx)
 	return LWORD(ebx);
 }
 
-int bootoff_main(int argc, char **argv)
-{
-	do_doshelper(DOS_HELPER_BOOTDISK, 0);
-	return 0;
-}
-
-
-int booton_main(int argc, char **argv)
-{
-	do_doshelper(DOS_HELPER_BOOTDISK, 1);
-	return 0;
-}
-
 int dpmi_main(int argc, char **argv)
 {
 	if (argc == 1) {
+		int len;
 		com_printf("dosemu DPMI control program.\n\n");
 		com_printf("Usage: dpmi <switch> <value>\n\n");
 		com_printf("The following table lists the available parameters, "
@@ -73,12 +62,16 @@ int dpmi_main(int argc, char **argv)
 		com_printf("+--------------------------+-----------+----+---------------------------------+\n");
 		com_printf("| Parameter                |   Value   | Sw | Description                     |\n");
 		com_printf("+--------------------------+-----------+----+---------------------------------+\n");
-		com_printf("|$_dpmi                    |%#6x%s| -m | DPMI memory size in Kbytes      |\n",
-			    config.dpmi, config.dpmi ? "     " : "(off)");
+		com_printf("|$_dpmi                    |");
+		if (config.dpmi)
+			com_printf("%#x%n", config.dpmi, &len);
+		else
+			com_printf("%7s%n", "off", &len);
+		com_printf("%*s| -m | DPMI memory size in Kbytes      |\n", 11-len, "");
 		if (config.dpmi_base == -1)
 			com_printf("|$_dpmi_base               |    auto   | -b | Address of the DPMI memory pool |\n");
 		else
-			com_printf("|$_dpmi_base               |0x%08lx | -b | Address of the DPMI memory pool |\n", config.dpmi_base);
+			com_printf("|$_dpmi_base               |0x%08" PRIxPTR " | -b | Address of the DPMI memory pool |\n", config.dpmi_base);
 		com_printf("|$_pm_dos_api              |    %s    | -p | Protected mode DOS API support  |\n",
 			    config.pm_dos_api ? "on " : "off");
 		com_printf("|$_ignore_djgpp_null_derefs|    %s    | -n | Disable DJGPP NULL-deref protec.|\n",
@@ -221,8 +214,6 @@ void commands_plugin_init(void)
 	register_com_program("GENERIC", generic_main);
 
 	/* old xxx.S files */
-	register_com_program("BOOTOFF", bootoff_main);
-	register_com_program("BOOTON", booton_main);
 	register_com_program("DPMI", dpmi_main);
 	register_com_program("ECPUON", ecpuon_main);
 	register_com_program("ECPUOFF", ecpuoff_main);

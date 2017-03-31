@@ -371,15 +371,6 @@ void SDL_process_key(SDL_KeyboardEvent keyevent)
         }
 }
 
-static int probe_SDL_keyb(void)
-{
-	int result = FALSE;
-	if (Video == &Video_SDL) {
-		result = TRUE;
-	}
-	return result;
-}
-
 #ifdef X_SUPPORT
 int init_SDL_keyb(void *handle, Display *display)
 {
@@ -398,12 +389,16 @@ int init_SDL_keyb(void *handle, Display *display)
 }
 #endif
 
+static int sdl_kbd_probe(void)
+{
+	return (config.sdl == 1);
+}
+
 struct keyboard_client Keyboard_SDL =  {
 	"SDL",                  /* name */
-	probe_SDL_keyb,         /* probe */
+	sdl_kbd_probe,          /* probe */
 	NULL,                   /* init */
 	NULL,                   /* reset */
 	NULL,                   /* close */
-	NULL,                   /* run */
 	NULL                    /* set_leds */
 };

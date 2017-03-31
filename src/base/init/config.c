@@ -29,7 +29,7 @@
 #include "pktdrvr.h"
 #include "speaker.h"
 #include "sound/sound.h"
-
+#include "keyb_clients.h"
 #include "dos2linux.h"
 #include "utilities.h"
 #ifdef X86_EMULATOR
@@ -185,12 +185,10 @@ void dump_config_status(void (*printfunc)(const char *, ...))
         config.console_keyb, config.console_video);
     (*print)("kbd_tty %d\nexitearly %d\n",
         config.kbd_tty, config.exitearly);
-    (*print)("fdisks %d\nhdisks %d\nbootdisk %d\n",
-        config.fdisks, config.hdisks, config.bootdisk);
+    (*print)("fdisks %d\nhdisks %d\n",
+        config.fdisks, config.hdisks);
     (*print)("term_esc_char 0x%x\nterm_color %d\n",
         config.term_esc_char, config.term_color);
-    (*print)("X_updatelines %d\n\n",
-        config.X_updatelines);
     (*print)("xterm_title\n", config.xterm_title);
     (*print)("X_display \"%s\"\nX_title \"%s\"\nX_icon_name \"%s\"\n",
         (config.X_display ? config.X_display :""), config.X_title, config.X_icon_name);
@@ -205,7 +203,7 @@ void dump_config_status(void (*printfunc)(const char *, ...))
     (*print)("X_winsize_y %d\nX_gamma %d\nX_fullscreen %d\nvgaemu_memsize 0x%x\n",
         config.X_winsize_y, config.X_gamma, config.X_fullscreen,
 	     config.vgaemu_memsize);
-    (*print)("SDL_nogl %d\n", config.sdl_nogl);
+    (*print)("SDL_swrend %d\n", config.sdl_swrend);
     (*print)("vesamode_list %p\nX_lfb %d\nX_pm_interface %d\n",
         config.vesamode_list, config.X_lfb, config.X_pm_interface);
     (*print)("X_keycode %d\nX_font \"%s\"\n",
@@ -572,7 +570,8 @@ static void config_post_process(void)
 	}
     }
     /* console scrub */
-    if (!Video && getenv("DISPLAY") && !config.X && !config.term) {
+    if (!Video && getenv("DISPLAY") && !config.X && !config.term &&
+        config.cardtype != CARD_NONE) {
 	config.console_video = 0;
 	config.emuretrace = 0;	/* already emulated */
 #ifdef SDL_SUPPORT
@@ -600,6 +599,7 @@ static void config_post_process(void)
 #endif
 	}
     }
+#ifdef USE_CONSOLE_PLUGIN
     if (on_console()) {
 	if (!can_do_root_stuff && config.console_video) {
 	    /* force use of Slang-terminal on console too */
@@ -607,13 +607,25 @@ static void config_post_process(void)
 	    dbug_printf("no console on low feature (non-suid root) DOSEMU\n");
 	}
 	if (config.console_keyb == -1)
-	    config.console_keyb = can_do_root_stuff;
+	    config.console_keyb = KEYB_RAW;
 	if (config.speaker == SPKR_EMULATED) {
 	    register_speaker((void *)(uintptr_t)console_fd,
 			     console_speaker_on, console_speaker_off);
 	}
-    } else {
-	config.console_video = config.console_keyb = 0;
+    } else
+#endif
+    {
+	if (config.console_keyb == -1) {
+	    config.console_keyb =
+#ifdef USE_SLANG
+		    /* Slang will take over KEYB_OTHER */
+		    KEYB_OTHER
+#else
+		    KEYB_TTY
+#endif
+	    ;
+	}
+	config.console_video = 0;
 	if (config.speaker == SPKR_NATIVE) {
 	    config.speaker = SPKR_EMULATED;
 	}
@@ -773,7 +785,7 @@ config_init(int argc, char **argv)
     char           *basename;
     int i;
     const char * const getopt_string =
-       "23456ABCcD:dE:e:F:f:H:h:I:i::K:kL:M:mNOo:P:qSsTt::u:Vv:wXx:U:"
+       "23456ABCcD:dE:e:F:f:H:h:I:i::K:k::L:M:mNOo:P:qSsTt::u:Vv:wXx:U:"
        "gp"/*NOPs kept for compat (not documented in usage())*/;
 
     if (getenv("DOSEMU_INVOKED_NAME"))
@@ -958,21 +970,35 @@ config_init(int argc, char **argv)
 	    if (!dexe_running) config.hdiskboot = 0;
 	    break;
 	case 'B':
-	    if (!dexe_running) config.hdiskboot = 2;
+	    if (!dexe_running) config.hdiskboot = 1;
 	    break;
 	case 'C':
-	    config.hdiskboot = 1;
+	    config.hdiskboot = 2;
 	    break;
 	case 'c':
 	    config.console_video = 1;
 	    config.vga = 0;
 	    break;
 	case 'k':
-	    config.console_keyb = 1;
+	    if (optarg) {
+		switch (optarg[0]) {
+		case 's':
+		    config.console_keyb = KEYB_STDIO;
+		    break;
+		case 't':
+		    config.console_keyb = KEYB_TTY;
+		    break;
+		case 'r':
+		    config.console_keyb = KEYB_RAW;
+		    break;
+		}
+	    } else {
+		config.console_keyb = KEYB_RAW;
+	    }
 	    break;
 	case 't':
 	    /* terminal mode */
-	    config.X = config.console_keyb = config.console_video = 0;
+	    config.X = config.console_video = 0;
 	    config.term = 1;
 	    if (optarg) {
 		if (optarg[0] =='d')

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "emu.h"
+#include "sig.h"
 #include "keyboard.h"
 #include "keyb_clients.h"
 #include "keymaps.h"
@@ -18,7 +19,6 @@
 
 static t_unicode *paste_buffer = NULL;
 static int paste_len = 0, paste_idx = 0;
-int kbd_fd = -1;
 struct keyboard_client *Keyboard;
 
 static int paste_unicode_text(const t_unicode *text, int len)
@@ -76,23 +76,20 @@ static void paste_run(void)
 {
 	int count=0;
 
-	k_printf("KBD: paste_run running\n");
 	if (paste_buffer) {    /* paste in progress */
-		while (1) {
-			t_unicode keysym;
-			keysym = paste_buffer[paste_idx];
+		k_printf("KBD: paste_run running\n");
+		t_unicode keysym;
+		keysym = paste_buffer[paste_idx];
 
-			put_symbol(PRESS, keysym);
-			put_symbol(RELEASE, keysym);
+		put_symbol(PRESS, keysym);
+		put_symbol(RELEASE, keysym);
 
-			count++;
-			if (++paste_idx == paste_len) {   /* paste finished */
-				free(paste_buffer);
-				paste_buffer=NULL;
-				paste_len=paste_idx=0;
-				k_printf("KBD: paste finished\n");
-				break;
-			}
+		count++;
+		if (++paste_idx == paste_len) {   /* paste finished */
+			free(paste_buffer);
+			paste_buffer=NULL;
+			paste_len=paste_idx=0;
+			k_printf("KBD: paste finished\n");
 		}
 		k_printf("KBD: paste_run() pasted %d chars\n",count);
 	}
@@ -129,13 +126,12 @@ int keyb_client_init(void)
 {
 	int ok;
 
-	if(Keyboard == NULL)
-		register_keyboard_client(&Keyboard_raw);
+	register_keyboard_client(&Keyboard_raw);
 	register_keyboard_client(&Keyboard_none);
 	while(Keyboard) {
 		k_printf("KBD: probing '%s' mode keyboard client\n",
 			Keyboard->name);
-		ok = Keyboard->probe && Keyboard->probe();
+		ok = Keyboard->probe();
 
 		if (ok) {
 			k_printf("KBD: initialising '%s' mode keyboard client\n",
@@ -155,14 +151,8 @@ int keyb_client_init(void)
 		Keyboard = Keyboard->next;
 	}
 
-	/* Rationalize the keyboard config.
-	 * This should probably be done elsewhere . . .
-	 */
-	config.console_keyb = (Keyboard == &Keyboard_raw);
+	sigalrm_register_handler(paste_run);
 
-	/* We always have a least Keyboard_none to fall back too */
-	if(Keyboard == NULL)
-		Keyboard = &Keyboard_none;
 	return TRUE;
 }
 
@@ -178,24 +168,6 @@ void keyb_client_close(void)
 	if ((Keyboard!=NULL) && (Keyboard->close!=NULL)) {
 		Keyboard->close();
 	}
-}
-
-void keyb_client_run(void)
-{
-	/* if a paste operation is currently running, give it priority over the keyboard
-	 * frontend, in case the user continues typing before pasting is finished.
-	 */
-	if (paste_buffer!=NULL) {
-		paste_run();
-	}
-	else if ((Keyboard!=NULL) && (Keyboard->run!=NULL)) {
-		Keyboard->run();
-	}
-}
-
-void keyb_client_run_async(void *arg)
-{
-	keyb_client_run();
 }
 
 void keyb_client_set_leds(t_modifiers modifiers)

@@ -142,15 +142,12 @@ struct mouse_client {
   const char *name;
   int    (*init)(void);
   void   (*close)(void);
-  void   (*run)(void);         /* handle mouse events */
-  void   (*set_cursor)(int action, int mx, int my, int x_range, int y_range);
+  void   (*show_cursor)(int yes);
   void   (*post_init)(void);
 };
 
 void register_mouse_client(struct mouse_client *mouse);
-void mouse_client_set_cursor(int action, int mx, int my, int x_range,
-	int y_range);
-void mouse_client_run(void);
+void mouse_client_show_cursor(int yes);
 void mouse_client_close(void);
 void mouse_client_post_init(void);
 
@@ -158,7 +155,6 @@ extern struct mouse_client Mouse_raw;
 
 #include "keyboard.h"
 void mouse_keyboard(Boolean make, t_keysym key);
-void mouse_curtick(void);
 
 extern void mouse_priv_init(void);
 extern void dosemu_mouse_init(void);
@@ -173,8 +169,6 @@ extern void int74(void);
 
 int DOSEMUMouseProtocol(unsigned char *rBuf, int nBytes, int type,
 	const char *id);
-
-extern void mouse_io_callback(void *);
 
 struct mouse_drv {
   int  (*init)(void);

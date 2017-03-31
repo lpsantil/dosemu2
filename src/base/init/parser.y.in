@@ -133,7 +133,6 @@ static void dump_keytables_to_file(char *name);
 static void stop_terminal(void);
 static void start_disk(void);
 static void do_part(char *);
-static void start_bootdisk(void);
 static void start_floppy(void);
 static void stop_disk(int token);
 static void start_vnet(char *);
@@ -238,14 +237,14 @@ while (0)
 %token DOSBANNER FASTFLOPPY HOGTHRESH SPEAKER IPXSUPPORT IPXNETWORK NOVELLHACK
 %token ETHDEV TAPDEV VDESWITCH SLIRPARGS VNET
 %token DEBUG MOUSE SERIAL COM KEYBOARD TERMINAL VIDEO EMURETRACE TIMER
-%token MATHCO CPU CPUSPEED RDTSC BOOTA BOOTB BOOTC
+%token MATHCO CPU CPUSPEED RDTSC BOOTDRIVE SWAP_BOOTDRIVE
 %token L_XMS L_DPMI DPMI_BASE PM_DOS_API NO_NULL_CHECKS 
 %token PORTS DISK DOSMEM EXT_MEM
 %token L_EMS UMB_A0 UMB_B0 UMB_F0 EMS_SIZE EMS_FRAME EMS_UMA_PAGES EMS_CONV_PAGES
 %token TTYLOCKS L_SOUND L_SND_OSS L_JOYSTICK FULL_FILE_LOCKS
 %token DEXE ALLOWDISK FORCEXDOS XDOSONLY
 %token ABORT WARN
-%token BOOTDISK L_FLOPPY EMUSYS EMUINI L_X L_SDL
+%token L_FLOPPY EMUSYS EMUINI L_X L_SDL
 %token DOSEMUMAP LOGBUFSIZE LOGFILESIZE MAPPINGDRIVER
 %token LFN_SUPPORT
 	/* speaker */
@@ -271,7 +270,7 @@ while (0)
 %token X_FIXED_ASPECT X_ASPECT_43 X_LIN_FILT X_BILIN_FILT X_MODE13FACT X_WINSIZE
 %token X_GAMMA X_FULLSCREEN VGAEMU_MEMSIZE VESAMODE X_LFB X_PM_INTERFACE X_MGRAB_KEY X_BACKGROUND_PAUSE
 	/* sdl */
-%token SDL_NOGL
+%token SDL_SWREND
 	/* video */
 %token VGA MGA CGA EGA NONE CONSOLE GRAPHICS CHIPSET FULLREST PARTREST
 %token MEMSIZE VBIOS_SIZE_TOK VBIOS_SEG VGAEMUBIOS_FILE VBIOS_FILE 
@@ -280,7 +279,7 @@ while (0)
 
 %token FORCE_VT_SWITCH PCI
 	/* terminal */
-%token UPDATELINES COLOR ESCCHAR XTERM_TITLE
+%token COLOR ESCCHAR XTERM_TITLE
 	/* debug */
 %token IO PORT CONFIG READ WRITE KEYB PRINTER WARNING GENERAL HARDWARE
 %token L_IPC SOUND
@@ -289,7 +288,7 @@ while (0)
 	/* printer */
 %token LPT COMMAND TIMEOUT L_FILE
 	/* disk */
-%token L_PARTITION BOOTFILE WHOLEDISK THREEINCH THREEINCH_720 THREEINCH_2880 FIVEINCH FIVEINCH_360 ATAPI READONLY LAYOUT
+%token L_PARTITION WHOLEDISK THREEINCH THREEINCH_720 THREEINCH_2880 FIVEINCH FIVEINCH_360 READONLY LAYOUT
 %token SECTORS CYLINDERS TRACKS HEADS OFFSET HDIMAGE HDTYPE1 HDTYPE2 HDTYPE9 DISKCYL4096
 	/* ports/io */
 %token RDONLY WRONLY RDWR ORMASK ANDMASK RANGE FAST SLOW
@@ -512,23 +511,27 @@ line		: HOGTHRESH expression	{ config.hogthreshold = $2; }
 			c_printf("CONF: %sabling use of pentium timer\n",
 				(config.rdtsc?"En":"Dis"));
 		    }
-		| PCI bool 
-		    { 
+		| PCI bool
+		    {
 		      config.pci_video = ($2!=0);
 		      IFCLASS(CL_PCI) {}
 		      config.pci = (abs($2)==2); 
 		    }
-		| BOOTA
+		| BOOTDRIVE string_expr
                     {
-		      config.hdiskboot = 0;
+                      if ($2[0] == 0) {
+		        config.hdiskboot = -1;
+		      } else if ($2[0] >= 'a') {
+		        config.hdiskboot = $2[0] - 'a';
+		      } else {
+		        error("wrong value for $_bootdrive\n");
+		        config.hdiskboot = 2;
+		      }
+		      free($2);
 		    }
-		| BOOTC
-                    {
-		      config.hdiskboot = 1;
-		    }
-		| BOOTB
-                    {
-		      config.hdiskboot = 2;
+		| SWAP_BOOTDRIVE bool
+		    {
+		      config.swap_bootdrv = ($2!=0);
 		    }
 		| TIMER expression
 		    {
@@ -575,7 +578,7 @@ line		: HOGTHRESH expression	{ config.hogthreshold = $2; }
 		    if ($2 >= 0) config.ems_size = $2;
 		    if ($2 > 0) c_printf("CONF: %dk bytes EMS memory\n", $2);
 		    }
-		| UMB_A0 int_bool
+		| UMB_A0 bool
 		    {
 		    config.umb_a0 = $2;
 		    if ($2 > 0) c_printf("CONF: umb at 0a0000: %s\n", ($2) ? "on" : "off");
@@ -702,13 +705,9 @@ line		: HOGTHRESH expression	{ config.hogthreshold = $2; }
 		    { start_disk(); }
 		  '{' disk_flags '}'
 		    { stop_disk(DISK); }
-		| BOOTDISK
-		    { start_bootdisk(); }
-		  '{' disk_flags '}'
-		    { stop_disk(BOOTDISK); }
 		| L_FLOPPY
 		    { start_floppy(); }
-		  '{' disk_flags '}'
+		  '{' floppy_flags '}'
 		    { stop_disk(L_FLOPPY); }
                 | CDROM '{' string_expr '}'
                     {
@@ -1024,8 +1023,7 @@ check_user_var_list:
 x_flags		: x_flag
 		| x_flags x_flag
 		;
-x_flag		: UPDATELINES expression	{ config.X_updatelines = $2; }
-		| L_DISPLAY string_expr	{ free(config.X_display); config.X_display = $2; }
+x_flag		: L_DISPLAY string_expr	{ free(config.X_display); config.X_display = $2; }
 		| L_TITLE string_expr	{ free(config.X_title); config.X_title = $2; }
 		| X_TITLE_SHOW_APPNAME bool	{ config.X_title_show_appname = ($2!=0); }
 		| ICON_NAME string_expr	{ free(config.X_icon_name); config.X_icon_name = $2; }
@@ -1068,7 +1066,7 @@ x_flag		: UPDATELINES expression	{ config.X_updatelines = $2; }
 sdl_flags	: sdl_flag
 		| sdl_flags sdl_flag
 		;
-sdl_flag	: SDL_NOGL expression	{ config.sdl_nogl = ($2!=0); }
+sdl_flag	: SDL_SWREND expression	{ config.sdl_swrend = ($2!=0); }
 		;
 
 dexeflags	: dexeflag
@@ -1427,25 +1425,58 @@ printer_flag	: LPT expression	{ c_printers = $2 - 1; }
 
 	/* disks */
 
-optbootfile	: BOOTFILE string_expr
+floppy_flags	: floppy_flag
+		| floppy_flags floppy_flag
+		;
+floppy_flag	: READONLY              { dptr->wantrdonly = 1; }
+		| THREEINCH	{ dptr->default_cmos = THREE_INCH_FLOPPY; }
+		| THREEINCH_2880	{ dptr->default_cmos = THREE_INCH_2880KFLOP; }
+		| THREEINCH_720	{ dptr->default_cmos = THREE_INCH_720KFLOP; }
+		| FIVEINCH	{ dptr->default_cmos = FIVE_INCH_FLOPPY; }
+		| FIVEINCH_360	{ dptr->default_cmos = FIVE_INCH_360KFLOP; }
+		| L_FLOPPY string_expr
 		  {
-		  if (dptr->boot_name != NULL)
-		    yyerror("Two names for a boot-image file or device given.");
-		  dptr->boot_name = $2;
-                  }
-		| /* empty */
+		  struct stat st;
+
+		  if (dptr->dev_name != NULL)
+		    yyerror("Two names for a floppy-device given.");
+		  if (stat($2, &st) < 0) {
+		    yyerror("Could not stat floppy device.");
+		  }
+		  if (S_ISREG(st.st_mode)) {
+		    dptr->type = IMAGE;
+		  } else if (S_ISBLK(st.st_mode)) {
+		    dptr->type = FLOPPY;
+		  } else if (S_ISDIR(st.st_mode)) {
+		    dptr->type = DIR_TYPE;
+		  } else {
+		    yyerror("Floppy device/file %s is wrong type", $2);
+		  }
+		  dptr->dev_name = $2;
+		  dptr->floppy = 1;  // tell IMAGE and DIR we are a floppy
+		  }
+		| DEVICE string_expr
+		  {
+		  if (dptr->dev_name != NULL)
+		    yyerror("Two names for a disk-image file or device given.");
+		  dptr->dev_name = $2;
+		  }
+		| DIRECTORY string_expr
+		  {
+		  if (dptr->dev_name != NULL)
+		    yyerror("Two names for a directory given.");
+		  dptr->type = DIR_TYPE;
+		  dptr->dev_name = $2;
+		  }
+		| STRING
+		    { yyerror("unrecognized floppy disk flag '%s'\n", $1); free($1); }
+		| error
 		;
 
 disk_flags	: disk_flag
 		| disk_flags disk_flag
 		;
 disk_flag	: READONLY		{ dptr->wantrdonly = 1; }
-		| THREEINCH	{ dptr->default_cmos = THREE_INCH_FLOPPY; }
-		| THREEINCH_2880	{ dptr->default_cmos = THREE_INCH_288MFLOP; }
-		| THREEINCH_720	{ dptr->default_cmos = THREE_INCH_720KFLOP; }
-		| ATAPI		{ dptr->default_cmos = ATAPI_FLOPPY; }
-		| FIVEINCH	{ dptr->default_cmos = FIVE_INCH_FLOPPY; }
-		| FIVEINCH_360	{ dptr->default_cmos = FIVE_INCH_360KFLOP; }
 		| DISKCYL4096	{ dptr->diskcyl4096 = 1; }
 		| HDTYPE1	{ dptr->hdtype = 1; }
 		| HDTYPE2	{ dptr->hdtype = 2; }
@@ -1455,7 +1486,7 @@ disk_flag	: READONLY		{ dptr->wantrdonly = 1; }
 		| TRACKS expression	{ dptr->tracks = $2; }
 		| HEADS expression		{ dptr->heads = $2; }
 		| OFFSET expression	{ dptr->header = $2; }
-		| DEVICE string_expr optbootfile
+		| DEVICE string_expr
 		  {
 		  if (dptr->dev_name != NULL)
 		    yyerror("Two names for a disk-image file or device given.");
@@ -1475,28 +1506,21 @@ disk_flag	: READONLY		{ dptr->wantrdonly = 1; }
 		  dptr->header = HEADER_SIZE;
 		  dptr->dev_name = $2;
 		  }
-		| WHOLEDISK STRING optbootfile
+		| WHOLEDISK STRING
 		  {
 		  if (dptr->dev_name != NULL)
 		    yyerror("Two names for a harddisk given.");
 		  dptr->type = HDISK;
 		  dptr->dev_name = $2;
 		  }
-		| L_FLOPPY string_expr
-		  {
-		  if (dptr->dev_name != NULL)
-		    yyerror("Two names for a floppy-device given.");
-		  dptr->type = FLOPPY;
-		  dptr->dev_name = $2;
-		  }
-		| L_PARTITION string_expr INTEGER optbootfile
+		| L_PARTITION string_expr INTEGER
 		  {
                   yywarn("{ partition \"%s\" %d } the"
 			 " token '%d' is ignored and can be removed.",
 			 $2,$3,$3);
 		  do_part($2);
 		  }
-		| L_PARTITION string_expr optbootfile
+		| L_PARTITION string_expr
 		  { do_part($2); }
 		| DIRECTORY string_expr
 		  {
@@ -1986,26 +2010,6 @@ static void stop_printer(void)
 
 	/* disk */
 
-static void start_bootdisk(void)
-{
-  if (config.bootdisk)           /* Already a bootdisk configured ? */
-    yyerror("There is already a bootdisk configured");
-
-  dptr = &bootdisk;              /* set pointer do bootdisk-struct */
-
-  dptr->diskcyl4096 = 0;
-  dptr->sectors = 0;             /* setup default-values           */
-  dptr->heads   = 0;
-  dptr->tracks  = 0;
-  dptr->type    = FLOPPY;
-  dptr->default_cmos = THREE_INCH_FLOPPY;
-  dptr->timeout = 0;
-  dptr->dev_name = NULL;              /* default-values */
-  dptr->boot_name = NULL;
-  dptr->wantrdonly = 0;
-  dptr->header = 0;
-}
-
 static void start_floppy(void)
 {
   if (c_fdisks >= MAX_FDISKS)
@@ -2023,7 +2027,6 @@ static void start_floppy(void)
   dptr->default_cmos = THREE_INCH_FLOPPY;
   dptr->timeout = 0;
   dptr->dev_name = NULL;              /* default-values */
-  dptr->boot_name = NULL;
   dptr->wantrdonly = 0;
   dptr->header = 0;
 }
@@ -2046,13 +2049,16 @@ static void start_disk(void)
   dptr->hdtype = 0;
   dptr->timeout = 0;
   dptr->dev_name = NULL;              /* default-values */
-  dptr->boot_name = NULL;
   dptr->wantrdonly = 0;
   dptr->header = 0;
   dptr->dexeflags = 0;
 }
 
 static void start_vnet(char *mode) {
+  if (strcmp(mode, "") == 0) {
+    config.vnet = VNET_TYPE_AUTO;
+    return;
+  }
   if (strcmp(mode, "tap") == 0) {
     config.vnet = VNET_TYPE_TAP;
     return;
@@ -2101,21 +2107,20 @@ static void stop_disk(int token)
     yyerror("disk: no device/file-name given!");
   else                                /* check the file/device for existance */
     {
-      struct stat file_status;        /* date for checking that file */
+      struct stat st;
 
-      c_printf("device: %s ", dptr->dev_name);
-      if (stat(dptr->dev_name,&file_status) != 0) { /* Does this file exist? */
-        yyerror("Disk-device/file %s doesn't exist.",dptr->dev_name);
+      if (stat(dptr->dev_name, &st) != 0) { /* Does this file exist? */
+        yyerror("disk: device/file %s doesn't exist.", dptr->dev_name);
       }
     }
 
-  if (dptr->type == NODISK)    /* Is it one of bootdisk, floppy, harddisk ? */
+  if (dptr->type == NODISK)    /* Is it one of image, floppy, harddisk ? */
     yyerror("disk: no device/file-name given!"); /* No, error */
   else
-    c_printf("type %d ", dptr->type);
+    c_printf("CONF: disk type '%s'", disk_t_str(dptr->type));
 
   if (dptr->type == PARTITION) {
-    c_printf("partition# %d ", dptr->part_info.number);
+    c_printf(" partition# %d", dptr->part_info.number);
 #ifdef __linux__
     mtab = NULL;
     if ((f = setmntent(MOUNTED, "r")) != NULL) {
@@ -2142,17 +2147,9 @@ static void stop_disk(int token)
   }
 
   if (dptr->header)
-    c_printf("header_size: %ld ", (long) dptr->header);
+    c_printf(" header_size: %ld", (long) dptr->header);
 
-  c_printf("h: %d  s: %d   t: %d", dptr->heads, dptr->sectors,
-	   dptr->tracks);
-
-  if (token == BOOTDISK) {
-    config.bootdisk = 1;
-    use_bootdisk = 1;
-    c_printf(" bootdisk\n");
-  }
-  else if (token == L_FLOPPY) {
+  if (token == L_FLOPPY) {
     c_printf(" floppy %c:\n", 'A'+c_fdisks);
     c_fdisks++;
     config.fdisks = c_fdisks;
@@ -2855,7 +2852,7 @@ int parse_config(char *confname, char *dosrcname)
     /* force a BootC,
      * regardless what ever was set in the config files
      */
-    config.hdiskboot = 1;
+    config.hdiskboot = 2;
   }
   else {
     if (get_config_variable("c_dexeonly")) {

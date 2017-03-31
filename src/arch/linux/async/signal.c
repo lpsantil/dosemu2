@@ -12,12 +12,14 @@
 #include <sys/eventfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/syscall.h>
 #include <sys/mman.h>
 #include <assert.h>
 #include <linux/version.h>
 
 #include "emu.h"
+#ifdef __linux__
+#include "sys_vm86.h"
+#endif
 #include "bios.h"
 #include "mouse.h"
 #include "video.h"
@@ -124,6 +126,13 @@ struct sigchld_hndl {
 static struct sigchld_hndl chld_hndl[MAX_SIGCHLD_HANDLERS];
 static int chd_hndl_num;
 
+#define MAX_SIGALRM_HANDLERS 50
+struct sigalrm_hndl {
+  void (*handler)(void);
+};
+static struct sigalrm_hndl alrm_hndl[MAX_SIGALRM_HANDLERS];
+static int alrm_hndl_num;
+
 static sigset_t q_mask;
 static sigset_t nonfatal_q_mask;
 static sigset_t fatal_q_mask;
@@ -152,7 +161,6 @@ struct eflags_fs_gs eflags_fs_gs;
 static void (*sighandlers[NSIG])(struct sigcontext *, siginfo_t *);
 static void (*qsighandlers[NSIG])(int sig, siginfo_t *si, void *uc);
 
-static void sigquit(struct sigcontext *, siginfo_t *);
 static void sigalrm(struct sigcontext *, siginfo_t *);
 static void sigio(struct sigcontext *, siginfo_t *);
 static void sigasync(int sig, siginfo_t *si, void *uc);
@@ -477,6 +485,14 @@ static void sig_child(struct sigcontext *scp, siginfo_t *si)
   SIGNAL_save(cleanup_child, &si->si_pid, sizeof(si->si_pid), __func__);
 }
 
+int sigalrm_register_handler(void (*handler)(void))
+{
+  assert(alrm_hndl_num < MAX_SIGALRM_HANDLERS);
+  alrm_hndl[alrm_hndl_num].handler = handler;
+  alrm_hndl_num++;
+  return 0;
+}
+
 void leavedos_from_sig(int sig)
 {
   /* anything more sophisticated? */
@@ -636,7 +652,13 @@ static void sigstack_init(void)
   stack_t dummy = { .ss_flags = SS_DISABLE | SS_AUTODISARM };
   int err = sigaltstack(&dummy, NULL);
 #if SIGALTSTACK_WA
-  if (err && errno == EINVAL) {
+  if ((err && errno == EINVAL)
+#ifdef __i386__
+      /* kernels before 4.11 had the needed functionality only for 64bits */
+      || kernel_version_code < KERNEL_VERSION(4, 11, 0)
+#endif
+     )
+  {
     need_sas_wa = 1;
     warn("Enabling sigaltstack() work-around\n");
     /* for SAS WA block all signals. If we dont, there is a
@@ -667,7 +689,12 @@ static void sigstack_init(void)
     }
   }
 #else
-  if (err && errno == EINVAL) {
+  if ((err && errno == EINVAL)
+#ifdef __i386__
+      || kernel_version_code < KERNEL_VERSION(4, 11, 0)
+#endif
+     )
+   {
     error("Your kernel does not support SS_AUTODISARM and the "
 	  "work-around in dosemu is not enabled.\n");
     config.exitearly = 1;
@@ -722,9 +749,9 @@ signal_pre_init(void)
   sigemptyset(&q_mask);
   sigemptyset(&nonfatal_q_mask);
   registersig(SIGALRM, sigalrm);
-  registersig(SIGQUIT, sigquit);
   registersig(SIGIO, sigio);
   registersig(SIGCHLD, sig_child);
+  newsetqsig(SIGQUIT, leavedos_signal);
   newsetqsig(SIGINT, leavedos_signal);   /* for "graceful" shutdown for ^C too*/
   newsetqsig(SIGHUP, leavedos_signal);	/* for "graceful" shutdown */
   newsetqsig(SIGTERM, leavedos_signal);
@@ -745,6 +772,7 @@ signal_pre_init(void)
   sigprocmask(SIG_BLOCK, &q_mask, NULL);
 
   signal(SIGPIPE, SIG_IGN);
+  dosemu_pthread_self = pthread_self();
 }
 
 void
@@ -762,8 +790,6 @@ signal_init(void)
   }
 #endif
 
-  dosemu_tid = gettid();
-  dosemu_pthread_self = pthread_self();
   sh_tid = coopth_create("signal handling");
   /* normally we don't need ctx handlers because the thread is detached.
    * But some crazy code (vbe.c) can call coopth_attach() on it, so we
@@ -865,6 +891,7 @@ static void SIGALRM_call(void *arg)
   static int first = 0;
   static hitimer_t cnt200 = 0;
   static hitimer_t cnt1000 = 0;
+  int i;
 
   if (first==0) {
     cnt200 =
@@ -873,34 +900,11 @@ static void SIGALRM_call(void *arg)
     first = 1;
   }
 
-  /* update mouse cursor before updating the screen */
-  mouse_curtick();
-
-  if (video_initialized) {
-    if (Video->update_screen)
-      Video->update_screen();
-    if (Video->handle_events)
-      Video->handle_events();
+  if (video_initialized && !config.vga)
     update_screen();
-  }
 
-  /* for the SLang terminal we'll delay the release of shift, ctrl, ...
-     keystrokes a bit */
-  /* although actually the event handler handles the keyboard in X, keyb_client_run
-   * still needs to be called in order to handle pasting.
-   */
-  if (!config.console_keyb)
-    keyb_client_run();
-
-  run_sound();
-
-  serial_run();
-
-  /* TRB - perform processing for the IPX Asynchronous Event Service */
-#ifdef IPX
-  if (config.ipxsup)
-    AESTimerTick();
-#endif
+  for (i = 0; i < alrm_hndl_num; i++)
+    alrm_hndl[i].handler();
 
   if (config.rdtsc)
     update_cputime_TSCBase();
@@ -961,7 +965,6 @@ static void SIGALRM_call(void *arg)
 /*    g_printf("**** ALRM: 1sec\n"); */
     rtc_update();
   }
-
 }
 
 /* DANG_BEGIN_FUNCTION SIGNAL_save
@@ -1036,12 +1039,12 @@ static void sigalrm(struct sigcontext *scp, siginfo_t *si)
 __attribute__((noinline))
 static void sigasync0(int sig, struct sigcontext *scp, siginfo_t *si)
 {
-  /* can't use pthread_self() here since the TLS is always set to dosemu's *
-   * in any case this should not happens since async signals are blocked   *
-   * in other threads							   */
-  if (gettid() != dosemu_tid)
-    dosemu_error("Signal %i from thread %i (main is %i)\n", sig,
-	    gettid(), dosemu_tid);
+  pthread_t tid = pthread_self();
+  if (!pthread_equal(tid, dosemu_pthread_self)) {
+    char name[128];
+    pthread_getname_np(tid, name, sizeof(name));
+    dosemu_error("Async signal %i from thread %s\n", sig, name);
+  }
   if (sighandlers[sig])
 	  sighandlers[sig](scp, si);
 }
@@ -1058,19 +1061,6 @@ static void sigasync(int sig, siginfo_t *si, void *uc)
 #endif
 
 
-static void sigquit(struct sigcontext *scp, siginfo_t *si)
-{
-  in_vm86 = 0;
-
-  error("sigquit called\n");
-  show_ints(0, 0x33);
-  show_regs(__FILE__, __LINE__);
-
-  WRITE_BYTE(BIOS_KEYBOARD_FLAGS, 0x80);	/* ctrl-break flag */
-
-  do_soft_int(0x1b);
-}
-
 void do_periodic_stuff(void)
 {
     check_leavedos();
@@ -1082,7 +1072,7 @@ void do_periodic_stuff(void)
 	mhp_debug(DBG_POLL, 0, 0);
 #endif
 
-    if (Video->change_config)
+    if (video_initialized && Video && Video->change_config)
 	update_xtitle();
 }
 

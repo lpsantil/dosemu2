@@ -237,7 +237,6 @@
 #include "bios.h"
 #include "video.h"
 #include "memory.h"
-#include "remap.h"
 #include "vgaemu.h"
 #include "vgatext.h"
 #include "render.h"
@@ -455,6 +454,7 @@ static void X_show_mouse_cursor(int yes);
 static void X_set_mouse_cursor(int yes, int mx, int my, int x_range, int y_range);
 static struct bitmap_desc X_lock_canvas(void);
 static void X_lock(void);
+static void X_unlock_canvas(void);
 static void X_unlock(void);
 
 void kdos_recv_msg(char *);
@@ -485,7 +485,8 @@ struct render_system Render_X =
 {
    put_ximage,
    X_lock_canvas,
-   X_unlock
+   X_unlock_canvas,
+   "X",
 };
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -560,7 +561,7 @@ int X_init()
   char *s;
   int i, features, ret;
 
-  X_printf("X: X_init\n");
+  c_printf("X: X_init\n");
 
   X_pre_init();
   /* Open X connection. */
@@ -790,6 +791,7 @@ int X_init()
   X_register_speaker(display);
 
   pthread_create(&event_thr, NULL, X_handle_events, NULL);
+  pthread_setname_np(event_thr, "dosemu: X ev");
 
   return 0;
 }
@@ -925,7 +927,6 @@ void X_get_screen_info()
   }
 
   X_csd.bits = ximage_bits_per_pixel;
-  X_csd.bytes = (ximage_bits_per_pixel + 7) >> 3;
   X_csd.r_mask = visual->red_mask;
   X_csd.g_mask = visual->green_mask;
   X_csd.b_mask = visual->blue_mask;
@@ -1358,6 +1359,11 @@ static void X_unlock(void)
   XUnlockDisplay(display);
 }
 
+static void X_unlock_canvas(void)
+{
+  X_unlock();
+}
+
 /* From SDL: Called after unmapping a window - waits until the window is unmapped */
 static void X_wait_unmapped(Window win)
 {
@@ -1484,7 +1490,10 @@ static int __X_handle_events(XEvent *e)
 
 	case FocusOut:
 	  X_printf("X: focus out\n");
-	  if (mainwindow == fullscreenwindow) break;
+	  /* XGrabKeyboard() generates spurious FocusOut event.
+	   * This is even documented in its man page. */
+	  if (mainwindow == fullscreenwindow || kbd_grab_active)
+	    break;
 	  render_lose_focus();
 	  output_byte_8042(port60_buffer | 0x80);
 	  if (config.X_background_pause && !dosemu_user_froze) freeze_dosemu ();
@@ -1832,7 +1841,6 @@ ColorSpaceDesc MakeSharedColormap()
     { 4, 5, 4 }, { 4, 5, 3 }, { 4, 4, 3 }, { 3, 4, 3 }
   };
 
-  csd.bytes = 1;
   csd.pixel_lut = NULL;
   csd.r_mask = csd.g_mask = csd.b_mask = 0;
 
@@ -2465,8 +2473,7 @@ static struct mouse_client Mouse_X =  {
   "X",          /* name */
   X_mouse_init, /* init */
   NULL,		/* close */
-  NULL,		/* run */
-  X_set_mouse_cursor /* set_cursor */
+  X_show_mouse_cursor /* show_cursor */
 };
 
 

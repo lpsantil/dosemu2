@@ -37,7 +37,6 @@
 #include <stdint.h>
 #include <sys/mman.h>	/* mprotect() */
 
-#include "remap.h"
 #include "vgaemu.h"
 #include "mapping.h"
 #include "init.h"
@@ -83,7 +82,6 @@ static void do_nothing_remap(struct RemapObjectStruct *a) {};
 static int do_nearly_nothing(RemapObject *a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned f) { return 0; };
 static RectArea do_nearly_something_rect(RemapObject *ro, int x0, int y0, int width, int height) { RectArea ra = {0, 0, 0, 0}; return ra; };
 static RectArea do_nearly_something_mem(RemapObject *ro, int offset, int len) { RectArea ra = {0, 0, 0, 0}; return ra; };
-static void adjust_gamma(RemapObject *ro, unsigned gamma);
 
 static unsigned u_pow(unsigned, unsigned);
 static unsigned gamma_fix(unsigned, unsigned);
@@ -149,7 +147,7 @@ static void do_base_init(void)
  * initialize a remap object
  */
 static RemapObject *_remap_init(int src_mode, int dst_mode, int features,
-	const ColorSpaceDesc *color_space)
+	const ColorSpaceDesc *color_space, int gamma)
 {
   RemapObject *ro = malloc(sizeof(*ro));
   int color_lut_size = 256;
@@ -176,8 +174,11 @@ static RemapObject *_remap_init(int src_mode, int dst_mode, int features,
   ro->true_color_lut = NULL;
   ro->color_lut_size = 0;
   ro->bit_lut = NULL;
-  ro->gamma_lut = NULL;
-  ro->gamma = 100;
+  ro->gamma_lut = malloc(256 * (sizeof *ro->gamma_lut));
+  for(u = 0; u < 256; u++)
+    ro->gamma_lut[u] = gamma_fix(u, gamma);
+  ro->gamma = gamma;
+
   ro->remap_func = ro->remap_func_init = NULL;
   ro->remap_func_flags = 0;
   ro->remap_func_name = "no_func";
@@ -360,38 +361,6 @@ unsigned u_pow(unsigned a, unsigned b)
   }
 
   return r;
-}
-
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-static void adjust_gamma(RemapObject *ro, unsigned gamma)
-{
-  int i;
-
-  if (ro->gamma == gamma)
-    return;
-
-  if(gamma == 100 || gamma == 0) {
-    gamma = 100;
-    if(ro->gamma_lut != NULL) { free(ro->gamma_lut); ro->gamma_lut = NULL; }
-  }
-  else {
-    if(ro->gamma_lut == NULL) {
-      ro->gamma_lut = malloc(256 * (sizeof *ro->gamma_lut));
-      if(ro->gamma_lut == NULL) {
-        ro->state |= ROS_MALLOC_FAIL;
-        gamma = 100;
-      }
-    }
-  }
-
-  if(gamma != 100) {
-    for(i = 0; i < 256; i++) {
-      ro->gamma_lut[i] = gamma_fix(i, gamma);
-    }
-  }
-
-  ro->gamma = gamma;
 }
 
 
@@ -980,17 +949,6 @@ static RectArea remap_mem_1(RemapObject *ro, int offset, int len)
 
   ra.width = ro->dst_width;
 
-  i1 = offset / ro->src_scan_len;
-  i2 = offset % ro->src_scan_len;
-  j1 = (offset + len) / ro->src_scan_len;
-  j2 = (offset + len) % ro->src_scan_len;
-
-  /* make sure it's all visible */
-  if(i2 >= ro->src_width) i1++, i2 = 0, offset = i1 * ro->src_scan_len;
-  if(i1 >= ro->src_height || i1 > j1) return ra;
-  if(j2 >= ro->src_width) j1++, j2 = 0;
-  if(j1 >= ro->src_height) j1 = ro->src_height, j2 = 0;
-
   switch(ro->dst_mode) {
     case MODE_TRUE_15:
     case MODE_TRUE_16: pixel_size = 2; break;
@@ -1001,65 +959,18 @@ static RectArea remap_mem_1(RemapObject *ro, int offset, int len)
     default: pixel_size = 1;
   }
 
-  if(ro->remap_func_flags & RFF_REMAP_RECT) {
-    if(i2) {
-      ro->src_offset = offset;
-      ro->src_x0 = i2;
-      ro->src_x1 = ro->src_width;
-      ro->src_y0 = i1;
-      ro->src_y1 = ro->src_y0 + 1;
-      ro->dst_x0 = bre_d_0(i2, ro->src_width, ro->dst_width);
-      ro->dst_x1 = ro->dst_width;
-      ro->dst_y0 = bre_d_0(i1, ro->src_height, ro->dst_height);
-      ro->dst_y1 = bre_d_0(i1 + 1, ro->src_height, ro->dst_height);
-      ro->dst_offset = ro->dst_y0 * ro->dst_scan_len + ro->dst_x0 * pixel_size;
-      ra.y = ro->dst_y0;
-      ra.height = ro->dst_y1 - ra.y;
-      REMAP_AREA_DEBUG_FUNC(ro);
-      if(ro->dst_y0 != ro->dst_y1 && ro->dst_x1 != ro->dst_x0) {
-        ro->remap_func(ro);
-      }
-      offset += ro->src_scan_len - i2;
-      i2 = 0;
-      i1++;
-    }
-    if(i1 < j1) {
-      ro->src_offset = offset;
-      ro->src_x0 = 0;
-      ro->src_x1 = ro->src_width;
-      ro->src_y0 = i1;
-      ro->src_y1 = j1;
-      ro->dst_x0 = bre_d_0(i2, ro->src_width, ro->dst_width);
-      ro->dst_x1 = ro->dst_width;
-      ro->dst_y0 = bre_d_0(i1, ro->src_height, ro->dst_height);
-      ro->dst_y1 = bre_d_0(j1, ro->src_height, ro->dst_height);
-      ro->dst_offset = ro->dst_y0 * ro->dst_scan_len;
-      ra.height = ro->dst_y1 - ra.y;
-      REMAP_AREA_DEBUG_FUNC(ro);
-      if(ro->dst_y0 != ro->dst_y1) {
-        ro->remap_func(ro);
-      }
-      offset += ro->src_scan_len * (j1 - i1);
-    }
-    if(j2) {
-      ro->src_offset = offset;
-      ro->src_x0 = 0;
-      ro->src_x1 = j2;
-      ro->src_y0 = j1;
-      ro->src_y1 = ro->src_y0 + 1;
-      ro->dst_x0 = bre_d_0(i2, ro->src_width, ro->dst_width);
-      ro->dst_x1 = bre_d_0(j2, ro->src_width, ro->dst_width);
-      ro->dst_y0 = bre_d_0(j1, ro->src_height, ro->dst_height);
-      ro->dst_y1 = bre_d_0(j1 + 1, ro->src_height, ro->dst_height);
-      ro->dst_offset = ro->dst_y0 * ro->dst_scan_len;
-      ra.height = ro->dst_y1 - ra.y;
-      REMAP_AREA_DEBUG_FUNC(ro);
-      if(ro->dst_y0 != ro->dst_y1 && ro->dst_x1 != ro->dst_x0) {
-        ro->remap_func(ro);
-      }
-    }
-  }
-  else if(ro->remap_func_flags & RFF_REMAP_LINES) {
+  i1 = offset / ro->src_scan_len;
+  i2 = (offset % ro->src_scan_len) / pixel_size;
+  j1 = (offset + len) / ro->src_scan_len;
+  j2 = ((offset + len) % ro->src_scan_len) / pixel_size;
+
+  /* make sure it's all visible */
+  if(i2 >= ro->src_width) i1++, i2 = 0, offset = i1 * ro->src_scan_len;
+  if(i1 >= ro->src_height || i1 > j1) return ra;
+  if(j2 >= ro->src_width) j1++, j2 = 0;
+  if(j1 >= ro->src_height) j1 = ro->src_height, j2 = 0;
+
+  if (ro->remap_func_flags & (RFF_REMAP_RECT | RFF_REMAP_LINES)) {
     ro->src_offset = i1 * ro->src_scan_len;
     ro->src_x0 = ro->dst_x0 = 0;
     ro->src_x1 = ro->src_width;
@@ -1067,8 +978,8 @@ static RectArea remap_mem_1(RemapObject *ro, int offset, int len)
     ro->src_y0 = i1;
     ro->src_y1 = j1;
     if(j2) ro->src_y1++;
-    ro->dst_y0 = bre_d_0(i1, ro->src_height, ro->dst_height);
-    ro->dst_y1 = bre_d_0(j1, ro->src_height, ro->dst_height);
+    ro->dst_y0 = bre_d_0(ro->src_y0, ro->src_height, ro->dst_height);
+    ro->dst_y1 = bre_d_0(ro->src_y1, ro->src_height, ro->dst_height);
     ro->dst_offset = ro->dst_y0 * ro->dst_scan_len;
     ra.y = ro->dst_y0;
     ra.height = ro->dst_y1 - ro->dst_y0;
@@ -1078,17 +989,12 @@ static RectArea remap_mem_1(RemapObject *ro, int offset, int len)
     }
   }
   else {
-    ro->src_y0 = i1;
-    ro->src_y1 = j1;
-    if(j2) ro->src_y1++;
-    ro->dst_y0 = bre_d_0(i1, ro->src_height, ro->dst_height);
-    ro->dst_y1 = bre_d_0(j1, ro->src_height, ro->dst_height);
-    ra.y = ro->dst_y0;
-    ra.height = ro->dst_y1 - ro->dst_y0;
     ro->src_offset = ro->dst_offset = 0;
     ro->src_x0 = ro->dst_x0 = ro->src_y0 = ro->dst_y0 = 0;
-    ro->src_x1 = ro->src_width; ro->dst_x1 = ro->dst_width;
-    ro->src_y1 = ro->src_height; ro->dst_y1 = ro->dst_height;
+    ro->src_x1 = ro->src_width;
+    ro->dst_x1 = ro->dst_width;
+    ro->src_y1 = ro->src_height;
+    ro->dst_y1 = ro->dst_height;
     ra.height = ro->dst_height;
     REMAP_AREA_DEBUG_FUNC(ro);
     ro->remap_func(ro);
@@ -1167,8 +1073,13 @@ static RectArea remap_rect_1(RemapObject *ro, int x0, int y0, int width, int hei
   else {
     ro->src_offset = ro->dst_offset = 0;
     ro->src_x0 = ro->dst_x0 = ro->src_y0 = ro->dst_y0 = 0;
-    ro->src_x1 = ro->src_width; ro->dst_x1 = ro->dst_width;
-    ro->src_y1 = ro->src_height; ro->dst_y1 = ro->dst_height;
+    ro->src_x1 = ro->src_width;
+    ro->dst_x1 = ro->dst_width;
+    ro->src_y1 = ro->src_height;
+    ro->dst_y1 = ro->dst_height;
+    ra.x = ra.y = 0;
+    ra.width = ro->dst_width;
+    ra.height = ro->dst_height;
     REMAP_AREA_DEBUG_FUNC(ro);
     ro->remap_func(ro);
   }
@@ -1249,6 +1160,9 @@ static RectArea remap_rect_dst_1(RemapObject *ro, int x0, int y0, int width, int
     ro->dst_x1 = ro->dst_width;
     ro->src_y1 = ro->src_height;
     ro->dst_y1 = ro->dst_height;
+    ra.x = ra.y = 0;
+    ra.width = ro->dst_width;
+    ra.height = ro->dst_height;
     REMAP_AREA_DEBUG_FUNC(ro);
     ro->remap_func(ro);
   }
@@ -1320,8 +1234,8 @@ static RectArea remap_mem_2(RemapObject *ro, int offset, int len)
     ro->src_y0 = i1;
     ro->src_y1 = j1;
     if(j2) ro->src_y1++;
-    ro->dst_y0 = bre_d_0(i1, ro->src_height, ro->dst_height);
-    ro->dst_y1 = bre_d_0(j1, ro->src_height, ro->dst_height);
+    ro->dst_y0 = bre_d_0(ro->src_y0, ro->src_height, ro->dst_height);
+    ro->dst_y1 = bre_d_0(ro->src_y1, ro->src_height, ro->dst_height);
     ro->dst_offset = ro->dst_y0 * ro->dst_scan_len;
     ra.y = ro->dst_y0;
     ra.height = ro->dst_y1 - ro->dst_y0;
@@ -1331,17 +1245,12 @@ static RectArea remap_mem_2(RemapObject *ro, int offset, int len)
     }
   }
   else {
-    ro->src_y0 = i1;
-    ro->src_y1 = j1;
-    if(j2) ro->src_y1++;
-    ro->dst_y0 = bre_d_0(i1, ro->src_height, ro->dst_height);
-    ro->dst_y1 = bre_d_0(j1, ro->src_height, ro->dst_height);
-    ra.y = ro->dst_y0;
-    ra.height = ro->dst_y1 - ro->dst_y0;
     ro->src_offset = ro->dst_offset = 0;
     ro->src_x0 = ro->dst_x0 = ro->src_y0 = ro->dst_y0 = 0;
-    ro->src_x1 = ro->src_width; ro->dst_x1 = ro->dst_width;
-    ro->src_y1 = ro->src_height; ro->dst_y1 = ro->dst_height;
+    ro->src_x1 = ro->src_width;
+    ro->dst_x1 = ro->dst_width;
+    ro->src_y1 = ro->src_height;
+    ro->dst_y1 = ro->dst_height;
     ra.height = ro->dst_height;
     REMAP_AREA_DEBUG_FUNC(ro);
     ro->remap_func(ro);
@@ -1460,89 +1369,6 @@ static int _find_supported_modes(unsigned dst_mode)
     rfd = rfd->next;
   }
   return modes;
-}
-#endif
-
-#if 0
-/*
- * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
- * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
- *
- *                       code generating functions
- *
- * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
- * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
- */
-
-/*
- * initialize a code object
- */
-CodeObj code_init(void)
-{
-  CodeObj co = {&do_nothing, NULL, NULL, 0, 0};
-  return co;
-}
-
-/*
- * destroy a code object
- */
-void code_done(CodeObj *co)
-{
-  if(co->mem != NULL) free(co->mem);
-  co->mem = co->text = NULL;
-  co->exec = &do_nothing;
-  co->size = co->pc = 0;
-}
-
-/*
- * append new instructions
- */
-void code_append_ins(CodeObj *co, int len, void *nc)
-{
-  unsigned char *mem, *text;
-  size_t pagesize = sysconf(_SC_PAGESIZE);
-  int size;
-
-  if(co->size == -1) return;
-
-  if(co->size < len + co->pc) {
-    size = len + co->pc + 2 * pagesize - 1;
-    mem = (unsigned char *) malloc(size);
-    if(mem == NULL) {
-      co->size = -1;
-      co->exec = &do_nothing;
-      return;
-    }
-
-    text = mem + pagesize - 1;
-    text -= ((uintptr_t) text) & (pagesize - 1);
-    size -= text - mem;
-
-    if(mprotect_mapping(MAPPING_VGAEMU, text, size, PROT_READ|PROT_WRITE|PROT_EXEC) < 0) {
-      co->size = -1;
-      co->exec = &do_nothing;
-      free(mem);
-      return;
-    }
-
-    if(co->pc) memcpy(text, co->text, co->pc);
-    free(co->mem);
-    co->mem = mem;
-    co->text = text;
-    co->exec = (void (*)(void)) text;
-    co->size = size;
-  }
-
-  memcpy(co->text + co->pc, nc, len);
-  co->pc += len;
-
-#if 0
-  fprintf(rdm, "[CodeObj]\n");
-  fprintf(rdm, "  co.mem  = 0x%x\n", (unsigned) co->mem);
-  fprintf(rdm, "  co.text = 0x%x\n", (unsigned) co->text);
-  fprintf(rdm, "  co.size = %d\n", co->size);
-  fprintf(rdm, "  co.pc   = %d\n", co->pc);
-#endif
 }
 #endif
 
@@ -3420,7 +3246,7 @@ void gen_c2to32_all(RemapObject *ro)
 static RemapObject *re_create_obj(RemapObject *old, int new_mode)
 {
   RemapObject *dst = _remap_init(new_mode, old->dst_mode,
-    old->features, old->dst_color_space);
+    old->features, old->dst_color_space, old->gamma);
   if (old->color_lut_size && dst->color_lut_size == old->color_lut_size)
     memcpy(dst->true_color_lut, old->true_color_lut, dst->color_lut_size *
 	sizeof(*dst->true_color_lut));
@@ -3440,7 +3266,7 @@ static int _remap_palette_update(void *ros, unsigned i,
 static RectArea _remap_remap_rect(void *ros, const struct bitmap_desc src_img,
 	int src_mode,
 	int x0, int y0, int width, int height,
-	struct bitmap_desc dst_img, int gamma)
+	struct bitmap_desc dst_img)
 {
   RemapObject *ro = RO(ros);
   if (src_mode != ro->src_mode)
@@ -3450,15 +3276,13 @@ static RectArea _remap_remap_rect(void *ros, const struct bitmap_desc src_img,
   ro->dst_image = dst_img.img;
   ro->src_resize(ro, src_img.width, src_img.height, src_img.scan_len);
   ro->dst_resize(ro, dst_img.width, dst_img.height, dst_img.scan_len);
-  adjust_gamma(ro, gamma);
   return ro->remap_rect(ro, x0, y0, width, height);
 }
 
 static RectArea _remap_remap_rect_dst(void *ros,
 	const struct bitmap_desc src_img,
 	int src_mode,
-	int x0, int y0, int width, int height, struct bitmap_desc dst_img,
-	int gamma)
+	int x0, int y0, int width, int height, struct bitmap_desc dst_img)
 {
   RemapObject *ro = RO(ros);
   if (src_mode != ro->src_mode)
@@ -3468,15 +3292,13 @@ static RectArea _remap_remap_rect_dst(void *ros,
   ro->dst_image = dst_img.img;
   ro->src_resize(ro, src_img.width, src_img.height, src_img.scan_len);
   ro->dst_resize(ro, dst_img.width, dst_img.height, dst_img.scan_len);
-  adjust_gamma(ro, gamma);
   return ro->remap_rect_dst(ro, x0, y0, width, height);
 }
 
 static RectArea _remap_remap_mem(void *ros,
 	const struct bitmap_desc src_img,
 	int src_mode,
-	unsigned src_start, int offset, int len, struct bitmap_desc dst_img,
-	int gamma)
+	unsigned src_start, int offset, int len, struct bitmap_desc dst_img)
 {
   RemapObject *ro = RO(ros);
   if (src_mode != ro->src_mode)
@@ -3486,7 +3308,6 @@ static RectArea _remap_remap_mem(void *ros,
   ro->dst_image = dst_img.img;
   ro->src_resize(ro, src_img.width, src_img.height, src_img.scan_len);
   ro->dst_resize(ro, dst_img.width, dst_img.height, dst_img.scan_len);
-  adjust_gamma(ro, gamma);
   return ro->remap_mem(ro, offset, len);
 }
 
@@ -3497,7 +3318,7 @@ static int _remap_get_cap(void *ros)
 }
 
 static void *_remap_remap_init(int dst_mode, int features,
-        const ColorSpaceDesc *color_space)
+        const ColorSpaceDesc *color_space, int gamma)
 {
   RemapObject **p, *o;
   p = malloc(sizeof(*p));
@@ -3508,6 +3329,7 @@ static void *_remap_remap_init(int dst_mode, int features,
   o->features = features;
   o->dst_color_space = color_space;
   o->palette_update = do_nearly_nothing;
+  o->gamma = gamma;
   *p = o;
   return p;
 }

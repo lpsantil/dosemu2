@@ -19,6 +19,7 @@
 
 #include "emu.h"
 #include "init.h"
+#include "sig.h"
 #include "bios.h"
 #include "int.h"
 #include "memory.h"
@@ -27,7 +28,7 @@
 #include "serial.h"
 #include "port.h"
 #include "utilities.h"
-
+#include "doshelpers.h"
 #include "dpmi.h"
 
 #include "port.h"
@@ -42,6 +43,11 @@
 #include "mousevid.h"
 #include "gcursor.h"
 #include "vgaemu.h"
+
+#define SETHIGH(x, v) HI_BYTE(x) = (v)
+#define SETLO_WORD(x, v) LO_WORD(x) = (v)
+#define SETLO_BYTE(x, v) LO_BYTE(x) = (v)
+#define SETWORD(x, v) SETLO_WORD(x, v)
 
 #define MOUSE_RX mouse_roundx(get_mx())
 #define MOUSE_RY mouse_roundy(get_my())
@@ -192,13 +198,13 @@ mouse_helper(struct vm86_regs *regs)
 {
   if (!mice->intdrv) {
     m_printf("MOUSE No Internaldriver set, exiting mouse_helper()\n");
-    SETWORD(&regs->eax, 0xffff);
+    SETWORD(regs->eax, 0xffff);
     return;
   }
 
-  SETWORD(&regs->eax, 0);		/* Set successful completion */
+  SETWORD(regs->eax, 0);		/* Set successful completion */
 
-  switch (LOW(regs->ebx)) {
+  switch (LO_BYTE(regs->ebx)) {
   case 0:				/* Reset iret for mouse */
     m_printf("MOUSE move iret !\n");
     mouse_enable_internaldriver();
@@ -217,55 +223,54 @@ mouse_helper(struct vm86_regs *regs)
     break;
   case 3:				/* Tell me what mode we are in ? */
     if (!mouse.threebuttons)
-      SETHIGH(&regs->ebx, 0x10);		/* We are currently in Microsoft Mode */
+      SETHIGH(regs->ebx, 0x10);		/* We are currently in Microsoft Mode */
     else
-      SETHIGH(&regs->ebx, 0x20);		/* We are currently in PC Mouse Mode */
-    SETLOW(&regs->ecx, mouse.speed_x);
-    SETHIGH(&regs->ecx, mouse.speed_y);
-    SETLOW(&regs->edx, mice->ignorevesa);
+      SETHIGH(regs->ebx, 0x20);		/* We are currently in PC Mouse Mode */
+    SETLO_BYTE(regs->ecx, mouse.speed_x);
+    SETHIGH(regs->ecx, mouse.speed_y);
+    SETLO_BYTE(regs->edx, mice->ignorevesa);
     break;
   case 4:				/* Set vertical speed */
-    if (LOW(regs->ecx) < 1) {
+    if (LO_BYTE(regs->ecx) < 1) {
       m_printf("MOUSE Vertical speed out of range. ERROR!\n");
-      SETWORD(&regs->eax, 1);
+      SETWORD(regs->eax, 1);
     } else
-      mice->init_speed_y = mouse.speed_y = LOW(regs->ecx);
+      mice->init_speed_y = mouse.speed_y = LO_BYTE(regs->ecx);
     break;
   case 5:				/* Set horizontal speed */
-    if (LOW(regs->ecx) < 1) {
+    if (LO_BYTE(regs->ecx) < 1) {
       m_printf("MOUSE Horizontal speed out of range. ERROR!\n");
-      SETWORD(&regs->eax, 1);
+      SETWORD(regs->eax, 1);
     } else
-      mice->init_speed_x = mouse.speed_x = LOW(regs->ecx);
+      mice->init_speed_x = mouse.speed_x = LO_BYTE(regs->ecx);
     break;
   case 6:				/* Ignore vesa modes */
-    mice->ignorevesa = LOW(regs->ecx);
+    mice->ignorevesa = LO_BYTE(regs->ecx);
     break;
   case 7:				/* get minimum internal resolution */
-    SETWORD(&regs->ecx, mouse.min_max_x);
-    SETWORD(&regs->edx, mouse.min_max_y);
+    SETWORD(regs->ecx, mouse.min_max_x);
+    SETWORD(regs->edx, mouse.min_max_y);
     break;
   case 8:				/* set minimum internal resolution */
-    mouse.min_max_x = WORD(regs->ecx);
-    mouse.min_max_y = WORD(regs->edx);
+    mouse.min_max_x = LO_WORD(regs->ecx);
+    mouse.min_max_y = LO_WORD(regs->edx);
     break;
-  case 0xf0:
+  case DOS_SUBHELPER_MOUSE_START_VIDEO_MODE_SET:
     m_printf("MOUSE Start video mode set\n");
     /* make sure cursor gets turned off */
     mouse_cursor(-1);
     break;
-  case 0xf1:
+  case DOS_SUBHELPER_MOUSE_END_VIDEO_MODE_SET:
     m_printf("MOUSE End video mode set\n");
     {
       /* redetermine the video mode:
          the stack contains: mode, saved ax, saved bx */
       unsigned int ssp = SEGOFF2LINEAR(regs->ss, 0);
-      unsigned int sp = WORD(regs->esp + 2 + 6);
+      unsigned int sp = (regs->esp + 2 + 6) & 0xffff;
       unsigned ax = popw(ssp, sp);
       int mode = popw(ssp, sp);
 
-      if (!mice->ignorevesa && mode >= 0x100 &&
-	    (mode & 0xff00) != 0x1100 && ax == 0x4f) {
+      if (!mice->ignorevesa && mode >= 0x100 && ax == 0x4f) {
 	/* no chargen function; check if vesa mode set successful */
 	vidmouse_set_video_mode(mode);
       } else {
@@ -275,6 +280,13 @@ mouse_helper(struct vm86_regs *regs)
     }
     /* replace cursor if necessary */
     mouse_cursor(1);
+    /* reset hide count on mode switches to fix this:
+     * https://github.com/stsp/dosemu2/issues/314
+     */
+    if (mouse.cursor_on < -1) {
+	m_printf("MOUSE: normalizing hide count, %i\n", mouse.cursor_on);
+	mouse.cursor_on = -1;
+    }
     break;
   case 0xf2:
     m_printf("MOUSE int74 helper\n");
@@ -285,7 +297,7 @@ mouse_helper(struct vm86_regs *regs)
     break;
   default:
     m_printf("MOUSE Unknown mouse_helper function\n");
-    SETWORD(&regs->eax, 1);		/* Set unsuccessful completion */
+    SETWORD(regs->eax, 1);		/* Set unsuccessful completion */
   }
 }
 
@@ -383,12 +395,10 @@ mouse_int(void)
 
   case 0x01:			/* Show Mouse Cursor */
     mouse_cursor(1);
-    mouse_client_set_cursor(3, -1, -1, -1, -1);
     break;
 
   case 0x02:			/* Hide Mouse Cursor */
     mouse_cursor(-1);
-    mouse_client_set_cursor(2, -1, -1, -1, -1);
     break;
 
   case 0x03:			/* Get Mouse Position and Button Status */
@@ -1201,6 +1211,7 @@ static void mouse_reset(void)
   mouse.unsc_x = mouse.unsc_y = 0;
   mouse.x_delta = mouse.y_delta = 0;
   mouse.need_resync = 0;
+  dragged.cnt = 0;
 
   mouse.textscreenmask = 0xffff;
   mouse.textcursormask = 0x7f00;
@@ -1216,11 +1227,15 @@ static void mouse_reset(void)
 void
 mouse_cursor(int flag)	/* 1=show, -1=hide */
 {
+  int need_resync = 0;
   /* Delete exclusion zone, if show cursor applied */
   if (flag == 1) {
     mouse.exc_lx = mouse.exc_ux = -1;
     mouse.exc_ly = mouse.exc_uy = -1;
-    mouse.x_delta = mouse.y_delta = 0;
+    if (mouse.x_delta || mouse.y_delta) {
+      mouse.x_delta = mouse.y_delta = 0;
+      need_resync = 1;
+    }
   }
 
   /* already on, don't do anything */
@@ -1234,8 +1249,9 @@ mouse_cursor(int flag)	/* 1=show, -1=hide */
   if ((flag == -1 && mouse.cursor_on == -1) ||
   		(flag == 1 && mouse.cursor_on == 0)){
 	  mouse_do_cur(1);
-    if (flag == 1)
+    if (flag == 1 && need_resync && !dragged.cnt)
       do_move_abs(mouse.px_abs, mouse.py_abs, mouse.px_range, mouse.py_range);
+    mouse_client_show_cursor(mouse.cursor_on >= 0);
   }
 
   m_printf("MOUSE: %s mouse cursor %d\n", mouse.cursor_on ? "hide" : "show", mouse.cursor_on);
@@ -1986,7 +2002,7 @@ static void call_int33_mouse_event_handler(void)
     m_printf("MOUSE: event %d, x %d, y %d, mx %d, my %d, b %x\n",
 	     mouse_events, get_mx(), get_my(), mickeyx(), mickeyy(),
 	     LWORD(ebx));
-    m_printf("MOUSE: .........jumping to %04x:%04x\n", LWORD(cs), LWORD(eip));
+    m_printf("MOUSE: .........jumping to %04x:%04x\n", mouse.cs, mouse.ip);
     SREG(ds) = mouse.cs;		/* put DS in user routine */
     do_call_back(mouse.cs, mouse.ip);
     REGS = saved_regs;
@@ -2048,13 +2064,14 @@ static void mouse_do_cur(int callback)
 
   if (mice->native_cursor || !callback)
     return;
-
+#if 0
   /* this callback is used to e.g. warp the X cursor if int33/ax=4
      requested it to be moved */
   mouse_client_set_cursor(mouse.cursor_on == 0?1: 0,
 		    get_mx() - mouse.x_delta,
 		    get_my() - mouse.y_delta,
 		    mouse.maxx - MOUSE_MINX +1, mouse.maxy - MOUSE_MINY +1);
+#endif
 }
 
 /* conditionally update the mouse cursor only if it's changed position. */
@@ -2121,11 +2138,13 @@ graph_cursor(void)
 }
 
 
-void
-mouse_curtick(void)
+static void mouse_curtick(void)
 {
   if (!mice->intdrv)
     return;
+
+  if (debug_level('m') >= 9)
+    m_printf("MOUSE: curtick x:%d  y:%d\n", MOUSE_RX, MOUSE_RY);
 
   /* HACK: we need some time for an app to sense the dragging event */
   if (dragged.cnt > 1) {
@@ -2136,8 +2155,6 @@ mouse_curtick(void)
   }
   if (mouse.cursor_on != 0)
     return;
-
-  m_printf("MOUSE: curtick x:%d  y:%d\n", MOUSE_RX, MOUSE_RY);
 
   /* we used to do an unconditional update here, but that causes a
   	distracting flicker in the mouse cursor. */
@@ -2191,6 +2208,7 @@ static int int33_mouse_init(void)
   mouse.speed_y = mice->init_speed_y;
 
   pic_seti(PIC_IMOUSE, NULL, 0, NULL);
+  sigalrm_register_handler(mouse_curtick);
 
   m_printf("MOUSE: INIT complete\n");
   return 1;
@@ -2243,12 +2261,6 @@ void mouse_set_win31_mode(void)
   m_printf("MOUSE: Enabled win31 mode\n");
 
   LWORD(eax) = 0;
-}
-
-void mouse_io_callback(void *arg)
-{
-  m_printf("MOUSE: We have data\n");
-  mouse_client_run();
 }
 
 void

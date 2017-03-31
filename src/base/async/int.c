@@ -33,6 +33,7 @@
 #include "video.h"
 #include "priv.h"
 #include "doshelpers.h"
+#include "lowmem.h"
 #include "plugin_config.h"
 #include "utilities.h"
 #include "redirect.h"
@@ -55,14 +56,14 @@
 #undef  DEBUG_INT1A
 
 #if WINDOWS_HACKS
-int win31_mode;
+enum win3x_mode_enum win3x_mode;
 #endif
 
-static char win31_title[256];
+static char win3x_title[256];
 
 static void dos_post_boot(void);
 static int post_boot;
-static int int21_hooked;
+static int int21_2f_hooked;
 
 static int int33(void);
 static int int66(void);
@@ -169,9 +170,11 @@ static void process_master_boot_record(void)
      leavedos(99);
    }
    LO(dx) = 0x80;  /* drive C:, DOS boots only from C: */
+   if (config.hdiskboot >= 2)
+     LO(dx) += config.hdiskboot - 2;
    HI(dx) = mbr->partition[i].start_head;
    LO(cx) = mbr->partition[i].start_sector;
-   HI(cx) = mbr->partition[i].start_track;
+   HI(cx) = PTBL_HL_GET(&mbr->partition[i], start_track);
    LWORD(eax) = 0x0201;  /* read one sector */
    LWORD(ebx) = 0x7c00;  /* target offset, ES is 0 */
    do_int_call_back(0x13);
@@ -198,7 +201,7 @@ int dos_helper(void)
   switch (LO(ax)) {
   case DOS_HELPER_DOSEMU_CHECK:			/* Linux dosemu installation test */
     LWORD(eax) = 0xaa55;
-    LWORD(ebx) = VERSION * 0x100 + SUBLEVEL; /* major version 0.49 -> 0049 */
+    LWORD(ebx) = VERSION_NUM * 0x100 + SUBLEVEL; /* major version 0.49 -> 0049 */
     /* The patch level in the form n.n is a float...
      * ...we let GCC at compiletime translate it to 0xHHLL, HH=major, LL=minor.
      * This way we avoid usage of float instructions.
@@ -275,7 +278,7 @@ int dos_helper(void)
 
   case DOS_HELPER_SHOW_BANNER:		/* show banner */
     if (!config.console_video)
-      install_dos(1);
+      install_dos();
     if (!config.dosbanner)
       break;
     p_dos_str(PACKAGE_NAME " "VERSTR "\nConfigured: " CONFIG_TIME "\n");
@@ -375,13 +378,62 @@ int dos_helper(void)
     serial_helper();
     break;
 
-  case DOS_HELPER_BOOTDISK:	/* set/reset use bootdisk flag */
-    use_bootdisk = LO(bx) ? 1 : 0;
-    break;
-
-  case DOS_HELPER_MOUSE_HELPER:	/* set mouse vector */
+  case DOS_HELPER_MOUSE_HELPER: {
+    uint8_t *p = MK_FP32(BIOSSEG, (long)&bios_in_int10_callback - (long)bios_f000);;
+    switch (LWORD(ebx)) {
+    case DOS_SUBHELPER_MOUSE_START_VIDEO_MODE_SET:
+      /* Note: we hook int10 very late, after display.sys already hooked it.
+       * So when we call previous handler in bios.S, we actually call
+       * display.sys's one, which will call us again.
+       * So have to protect ourselves from re-entrancy. */
+      *p = 1;
+      break;
+    case DOS_SUBHELPER_MOUSE_END_VIDEO_MODE_SET:
+      *p = 0;
+      break;
+    }
+#if WINDOWS_HACKS
+    if (win3x_mode != INACTIVE) {
+      /* work around win.com's small stack that gets overflown when
+       * display.sys's int10 handler calls too many things with hw interrupts
+       * enabled. */
+      static uint8_t *stk_buf;
+      static uint16_t old_ss, old_sp, new_sp;
+      static int to_copy;
+      uint8_t *stk, *new_stk;
+      switch (LWORD(ebx)) {
+      case DOS_SUBHELPER_MOUSE_START_VIDEO_MODE_SET:
+        stk = SEG_ADR((uint8_t *), ss, sp);
+        old_ss = SREG(ss);
+        old_sp = LWORD(esp);
+        stk_buf = lowmem_heap_alloc(1024);
+        assert(stk_buf);
+        to_copy = min(64, (0x10000 - old_sp) & 0xffff);
+        new_stk = stk_buf + 1024 - to_copy;
+        memcpy(new_stk, stk, to_copy);
+        SREG(ss) = DOSEMU_LMHEAP_SEG;
+        LWORD(esp) = DOSEMU_LMHEAP_OFFS_OF(new_stk);
+        new_sp = LWORD(esp);
+        break;
+      case DOS_SUBHELPER_MOUSE_END_VIDEO_MODE_SET:
+        if (SREG(ss) == DOSEMU_LMHEAP_SEG) {
+          int sp_delta = LWORD(esp) - new_sp;
+          stk = SEG_ADR((uint8_t *), ss, sp);
+          new_stk = LINEAR2UNIX(SEGOFF2LINEAR(old_ss, old_sp) + sp_delta);
+          memcpy(new_stk, stk, to_copy - sp_delta);
+          SREG(ss) = old_ss;
+          LWORD(esp) = old_sp + sp_delta;
+        } else {
+          error("SS changed by video mode set\n");
+        }
+        lowmem_heap_free(stk_buf);
+        break;
+      }
+    }
+#endif
     mouse_helper(&vm86s.regs);
     break;
+  }
 
   case DOS_HELPER_CDROM_HELPER:{
       E_printf("CDROM: in 0x40 handler! ax=0x%04x, bx=0x%04x, dx=0x%04x, "
@@ -494,13 +546,13 @@ int dos_helper(void)
   case DOS_HELPER_BOOTSECT:
       coopth_leave();
       fake_iret();
-      fdkernel_boot_mimic();
+      mimic_boot_blk();
       break;
   case DOS_HELPER_READ_MBR:
       boot();
       break;
   case DOS_HELPER_MBR:
-    if (LWORD(eax) == 0xfffe) {
+    if (HI(ax) == 0xff) {
       process_master_boot_record();
       break;
     }
@@ -510,7 +562,7 @@ int dos_helper(void)
     if (LWORD(eax) == DOS_HELPER_REALLY_EXIT) {
       /* terminate code is in bx */
       dbug_printf("DOS termination requested\n");
-      if (config.cardtype != CARD_NONE)
+      if (!config.dumb_video)
 	p_dos_str("\n\rLeaving DOS...\n\r");
       leavedos(LO(bx));
     }
@@ -764,6 +816,8 @@ SeeAlso: AH=8Ah"Phoenix",AX=E802h,AX=E820h,AX=E881h"Phoenix"
 	  LWORD(eax) = 0x3c00;
 	  LWORD(ebx) = ((mem - 0x3c00) >>6);
 	}
+	LWORD(ecx) = LWORD(eax);
+	LWORD(edx) = LWORD(ebx);
 	NOCARRY;
 	break;
     } else if (REG(eax) == 0xe820 && REG(edx) == 0x534d4150) {
@@ -1130,26 +1184,36 @@ Return: nothing
  */
 #define EMM_FILE_HANDLE 200
 
-/* MS-DOS */
-
 static int redir_it(void);
 static int int21(void);
+static int _int2f(void);
 
 static far_t s_int21;
+static far_t s_int2f;
 
 static void int21_post_boot(void)
 {
-  if (int21_hooked)
+  if (int21_2f_hooked)
     return;
   s_int21.segment = ISEG(0x21);
   s_int21.offset  = IOFF(0x21);
   SETIVEC(0x21, BIOSSEG, INT_OFF(0x21));
-  int21_hooked = 1;
+  int21_2f_hooked = 1;
   ds_printf("INT21: interrupt hook installed\n");
 
   interrupt_function[0x21][NO_REVECT] = int21;
   interrupt_function[0x21][REVECT] = NULL;
   reset_revectored(0x21, &vm86s.int_revectored);
+
+  s_int2f.segment = ISEG(0x2f);
+  s_int2f.offset  = IOFF(0x2f);
+  SETIVEC(0x2f, BIOSSEG, INT_OFF(0x2f));
+  ds_printf("INT2f: interrupt hook installed\n");
+
+  interrupt_function[0x2f][NO_REVECT] = _int2f;
+  interrupt_function[0x2f][REVECT] = NULL;
+  reset_revectored(0x2f, &vm86s.int_revectored);
+  mfs_set_stk_offs(6);
 }
 
 static void nr_int_chain(void *arg)
@@ -1270,10 +1334,12 @@ static int msdos(void)
       }
 
 #if WINDOWS_HACKS
-      if ((ptr = strstrDOS(cmd, "KRNL386")) ||
-          (ptr = strstrDOS(cmd, "KRNL286"))) {
-        win31_mode = ptr[4] - '0';
-      }
+      if (strstrDOS(cmd, "\\SYSTEM\\KRNL386.EXE"))
+        win3x_mode = ENHANCED;
+      if (strstrDOS(cmd, "\\SYSTEM\\KRNL286.EXE"))
+        win3x_mode = STANDARD;
+      if (strstrDOS(cmd, "\\SYSTEM\\KERNEL.EXE"))
+        win3x_mode = REAL;
       if ((ptr = strstrDOS(cmd, "\\SYSTEM\\DOSX.EXE")) ||
 	  (ptr = strstrDOS(cmd, "\\SYSTEM\\WIN386.EXE"))) {
         int have_args = 0;
@@ -1291,7 +1357,7 @@ static int msdos(void)
         memcpy(ptr+8, tmp_ptr, 7);
 #endif
         strcpy(ptr+8+7, ".exe");
-        win31_mode = tmp_ptr[4] - '0';
+        win3x_mode = tmp_ptr[4] - '0';
         if (have_args) {
           tmp_ptr = strchr(tmp_ptr, ' ');
           if (tmp_ptr) {
@@ -1300,19 +1366,32 @@ static int msdos(void)
           }
         }
 
+	/* the below is the winos2 mouse driver hook */
 	SETIVEC(0x66, BIOSSEG, INT_OFF(0x66));
 	interrupt_function[0x66][NO_REVECT] = int66;
       }
-      if (win31_mode) {
-        sprintf(win31_title, "Windows 3.1 in %i86 mode", win31_mode);
-        str = win31_title;
+
+      if (win3x_mode != INACTIVE) {
+        if ((ptr = strstrDOS(cmd, "\\SYSTEM\\DS")) &&
+          !strstrDOS(cmd, ".EXE")) {
+          error("Windows-3.1 stack corruption detected, fixing dswap.exe\n");
+          strcpy(ptr, "\\system\\dswap.exe");
+        }
+        if ((ptr = strstrDOS(cmd, "\\SYSTEM\\WS")) &&
+          !strstrDOS(cmd, ".EXE")) {
+          error("Windows-3.1 stack corruption detected, fixing wswap.exe\n");
+          strcpy(ptr, "\\system\\wswap.exe");
+        }
+
+        sprintf(win3x_title, "Windows 3.x in %i86 mode", win3x_mode);
+        str = win3x_title;
       }
 #endif
 
       if (!Video->change_config)
         return 0;
       if ((!title_hint[0] || strcmp(title_current, title_hint) != 0) &&
-          str != win31_title)
+          str != win3x_title)
         return 0;
 
       ptr = strrchr(str, '\\');
@@ -1329,7 +1408,7 @@ static int msdos(void)
       strncpy(cmdname, ptr, TITLE_APPNAME_MAXLEN-1);
       cmdname[TITLE_APPNAME_MAXLEN-1] = 0;
       ptr = strchr(cmdname, '.');
-      if (ptr && str != win31_title) *ptr = 0;
+      if (ptr && str != win3x_title) *ptr = 0;
       /* change the title */
       strcpy(title_current, cmdname);
       change_window_title(title_current);
@@ -1357,8 +1436,10 @@ static int int21(void)
 
 void int42_hook(void)
 {
-  /* see comments in bios.S:INT42HOOK_OFF */
-  jmp_to(BIOSSEG, INT_OFF(0x42));
+  /* original int10 vector should point here until vbios swaps it with 0x42.
+   * But our int10 never points here, so I doubt this is of any use. --stsp */
+  fake_iret();
+  int10();
 }
 
 /* ========================================================================= */
@@ -1667,7 +1748,7 @@ static int redir_it(void)
 void dos_post_boot_reset(void)
 {
   post_boot = 0;
-  int21_hooked = 0;
+  int21_2f_hooked = 0;
 }
 
 static void dos_post_boot(void)
@@ -1705,7 +1786,6 @@ static int int2f(void)
       idle(0, 100, 0, "int2f_idle_magic");
       LWORD(eax) = 0;
       return 1;
-    }
 
 #ifdef IPX
     case INT2F_DETECT_IPX:  /* TRB - detect IPX in int2f() */
@@ -1713,6 +1793,7 @@ static int int2f(void)
         return 1;
       break;
 #endif
+  }
 
     case 0xae00: {
       char cmdname[TITLE_APPNAME_MAXLEN];
@@ -1769,9 +1850,9 @@ static int int2f(void)
   case 0x16:		/* misc PM/Win functions */
     switch (LO(ax)) {
       case 0x00:		/* WINDOWS ENHANCED MODE INSTALLATION CHECK */
-    if (dpmi_active() && win31_mode) {
-      D_printf("WIN: WINDOWS ENHANCED MODE INSTALLATION CHECK: %i\n", win31_mode);
-      if (win31_mode == 3)
+    if (dpmi_active() && win3x_mode != INACTIVE) {
+      D_printf("WIN: WINDOWS ENHANCED MODE INSTALLATION CHECK: %i\n", win3x_mode);
+      if (win3x_mode == ENHANCED)
         LWORD(eax) = 0x0a03;
       else
         LWORD(eax) = 0;
@@ -1790,27 +1871,27 @@ static int int2f(void)
 	break;
 
       case 0x0a:			/* IDENTIFY WINDOWS VERSION AND TYPE */
-    if(dpmi_active() && win31_mode) {
+    if(dpmi_active() && win3x_mode != INACTIVE) {
       D_printf ("WIN: WINDOWS VERSION AND TYPE\n");
       LWORD(eax) = 0;
       LWORD(ebx) = 0x030a;	/* 3.10 */
-      LWORD(ecx) = win31_mode;
+      LWORD(ecx) = win3x_mode;
       return 1;
         }
       break;
 
       case 0x83:
-        if (dpmi_active() && win31_mode)
+        if (dpmi_active() && win3x_mode != INACTIVE)
             LWORD (ebx) = 0;	/* W95: number of virtual machine */
       case 0x81:		/* W95: enter critical section */
-        if (dpmi_active() && win31_mode) {
+        if (dpmi_active() && win3x_mode != INACTIVE) {
 	    D_printf ("WIN: enter critical section\n");
 	    /* LWORD(eax) = 0;	W95 DDK says no return value */
 	    return 1;
   }
       break;
       case 0x82:		/* W95: exit critical section */
-        if (dpmi_active() && win31_mode) {
+        if (dpmi_active() && win3x_mode != INACTIVE) {
 	    D_printf ("WIN: exit critical section\n");
 	    /* LWORD(eax) = 0;	W95 DDK says no return value */
 	    return 1;
@@ -1836,7 +1917,9 @@ static int int2f(void)
 	return 1;
     }
     break;
+  }
 
+  switch (HI(ax)) {
   case INT2F_XMS_MAGIC:
     if (!config.xms_size)
       break;
@@ -1858,6 +1941,14 @@ static int int2f(void)
   }
 
   return 0;
+}
+
+static int _int2f(void)
+{
+  int ret = int2f();
+  if (!ret)
+    chain_int_norevect(&s_int2f);
+  return 1;
 }
 
 static void int33_check_hog(void);
@@ -2309,8 +2400,8 @@ void update_xtitle(void)
       return;
   }
 
-  if (win31_mode && memcmp(cmd_ptr, "krnl", 4) == 0) {
-    cmd_ptr = win31_title;
+  if (win3x_mode != INACTIVE && memcmp(cmd_ptr, "krnl", 4) == 0) {
+    cmd_ptr = win3x_title;
     force_update = 1;
   }
 

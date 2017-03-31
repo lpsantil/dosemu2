@@ -10,8 +10,11 @@ top_builddir=.
 SUBDIR:=.
 -include Makefile.conf
 
-configure: configure.ac
+configure: configure.ac install-sh
 	autoreconf -v -I m4
+
+config.status: configure
+	./configure
 
 Makefile.conf: $(srcdir)/Makefile.conf.in $(srcdir)/configure $(srcdir)/default-configure
 	@echo "Running $(srcdir)/default-configure ..."
@@ -19,7 +22,7 @@ Makefile.conf: $(srcdir)/Makefile.conf.in $(srcdir)/configure $(srcdir)/default-
 
 install: changelog
 
-default clean realclean install: config.status
+default clean realclean install uninstall: config.status
 	@$(MAKE) -C src $@
 
 dosbin:
@@ -58,11 +61,15 @@ deb:
 	debuild -i -us -uc -b
 
 changelog:
-	git log >$@
+	if [ -d .git -o -f .git ]; then \
+		git log >$@ ; \
+	else \
+		echo "Unofficial build by `whoami`@`hostname`, `date`" >$@ ; \
+	fi
 
 log: changelog
 
-pristine distclean mrproper:  docsclean
+pristine distclean mrproper:  Makefile.conf docsclean
 	@$(MAKE) -C src pristine
 	rm -f Makefile.conf $(PACKAGE_NAME).spec
 	rm -f $(PACKETNAME).tar.gz
@@ -73,7 +80,9 @@ pristine distclean mrproper:  docsclean
 	rm -f `find . -name aclocal.m4`
 	rm -f `find . -name configure`
 	rm -f `find . -name Makefile.conf`
+	rm -rf `find . -name autom4te*.cache`
 	rm -f src/include/config.h
+	rm -f src/include/stamp-h1
 	rm -f src/include/config.h.in
 	rm -f src/include/confpath.h
 	rm -f src/include/version.h
@@ -85,8 +94,8 @@ pristine distclean mrproper:  docsclean
 	rm -f `find . -name '*[\.]rej'`
 	rm -f gen*.log
 	rm -f man/dosemu.1 man/dosemu.bin.1 man/ru/dosemu.1 man/ru/dosemu.bin.1
-	rm -rf autom4te*.cache
 	rm -f config.sub config.guess
+	rm -rf 2.*
 	$(srcdir)/mkpluginhooks clean
 
 tar: distclean
